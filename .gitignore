@@ -1,0 +1,33 @@
+# Bundled portable runtime (Node.js + npm, the Claude Code CLI, and Piper + its voice models) --
+# too large for a git repo and not source code; see the README for setup instructions instead.
+tools/
+node_modules/
+
+# Secrets -- real tokens/keys, never committed. See the matching *.local.*.example templates.
+*.local.bat
+*.local.json
+certs/*.pem
+
+# Personal, per-installation config -- only the example template is tracked.
+net-config.json
+
+# Runtime-generated state and output, not meaningful to publish.
+.session*.json
+audio_out/
+presented_content/
+*.log
+*-log.txt
+restart-log.txt
+*.err
+
+# Superseded by the unified agent-face-overlay.user.js, kept locally for reference only.
+legacy/
+
+# This session's own pre-migration snapshot, not part of the project.
+backup-de-migration/
+
+# OS and editor cruft.
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

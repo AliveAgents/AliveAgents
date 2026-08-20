@@ -1,0 +1,6 @@
+@echo off
+REM Copy this file to "token.local.bat" (without .example) and fill in your
+REM token from "claude setup-token". token.local.bat stays local and gets
+REM picked up automatically by env.bat / start.bat.
+
+set "CLAUDE_CODE_OAUTH_TOKEN=YOUR_TOKEN_HERE"

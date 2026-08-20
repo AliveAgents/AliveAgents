@@ -1,0 +1,20 @@
+{
+  "_comment": "Template for the SECOND laptop. Rename the file to net-config.json there. Set hubHost to Oscar's laptop's LAN IP.",
+  "self": "node2",
+  "role": "node",
+  "hubName": "thorsten",
+  "hubHost": "192.168.178.90",
+  "hubPort": 8788,
+  "agentName": "Nova",
+  "piperVoice": "en_US-ljspeech-high.onnx",
+  "overlayPort": 8787,
+  "domain": "Responsible for the website, Cloudflare, booking.com, and the git repository containing the website code.",
+  "personality": "Direct and pragmatic, answering in 1-3 short, chat-style sentences. No preamble phrases like \"As an AI, I would say\".",
+  "effort": "high",
+  "allowedTools": "WebSearch,WebFetch",
+  "permissionMode": "bypassPermissions",
+  "chrome": true,
+  "mcpConfig": "cloudflare-mcp.local.json",
+  "mainDisplay": false,
+  "faceStyle": "ava"
+}

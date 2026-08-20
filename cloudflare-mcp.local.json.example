@@ -1,0 +1,12 @@
+{
+  "_comment": "NEVER paste into the chat. Only meant for Nova -- only referenced via her net-config.json, not by Oscar's scripts. Replace YOUR_TOKEN_HERE with the real, narrowly scoped Cloudflare API token (My Profile -> API Tokens -> Create Token -> Edit zone DNS template -> restrict Zone Resources to the one domain).",
+  "mcpServers": {
+    "cloudflare": {
+      "type": "http",
+      "url": "https://mcp.cloudflare.com/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_TOKEN_HERE"
+      }
+    }
+  }
+}

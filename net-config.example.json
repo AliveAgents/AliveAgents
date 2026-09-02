@@ -8,6 +8,7 @@
   "agentName": "Nova",
   "piperVoice": "en_US-ljspeech-high.onnx",
   "overlayPort": 8787,
+  "_workDir": "Optional. The folder this agent's Claude session runs in -- point it at a real project and the agent works there, reading that project's CLAUDE.md automatically and keeping its own memory for it. Omit it and the agent works in the AliveAgents folder as before. e.g. \"D:/Projekte/Website\"",
   "domain": "Responsible for the website, Cloudflare, booking.com, and the git repository containing the website code.",
   "personality": "Direct and pragmatic, answering in 1-3 short, chat-style sentences. No preamble phrases like \"As an AI, I would say\".",
   "effort": "high",

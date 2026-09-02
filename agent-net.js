@@ -37,6 +37,16 @@ const CERT_DIR = path.join(__dirname, 'certs');
 // constant itself.
 const MAX_MSG_BYTES = Number(process.env.AGENT_MAX_MSG_BYTES) || 8 * 1024 * 1024;
 
+// How long a connection may sit idle before the OS starts probing whether the other side is still
+// there. Without this, a peer that disappeared WITHOUT closing the connection -- the hub being
+// restarted is the everyday case -- is never detected: TCP says nothing while no data flows, so
+// the node keeps a dead socket it believes is fine, and the reconnect loop below (which only fires
+// on 'close'/'error') never runs. Found live 2026-08-31: the node showed an ESTABLISHED connection
+// to a hub that had no connection at all, and the agent had been silently unreachable for hours.
+// 20s is well under the idle time of a quiet conversation, so a break is noticed within roughly
+// half a minute rather than never.
+const KEEPALIVE_MS = 20000;
+
 function certPath(name, kind) {
   return path.join(CERT_DIR, `${name}-${kind}.pem`);
 }
@@ -124,6 +134,10 @@ function startHub({ selfName, peers, port, host = '0.0.0.0', onMessage, onPeerUp
       return;
     }
 
+    // See the matching call on the node side for the full reasoning: without keepalive a peer that
+    // vanished silently is never noticed, and the socket lingers as a zombie.
+    socket.setKeepAlive(true, KEEPALIVE_MS);
+
     log(`[net] "${peerName}" connected (${socket.getProtocol()}, ${socket.getCipher().name})`);
     connected.set(peerName, socket);
     if (onPeerUp) onPeerUp(peerName);
@@ -147,6 +161,25 @@ function startHub({ selfName, peers, port, host = '0.0.0.0', onMessage, onPeerUp
 
   return {
     server,
+    // Accepts a newly enrolled node WITHOUT restarting the hub. Both places that decide whether a
+    // connection is allowed have to learn about it: OpenSSL's own chain validation (the `ca` list,
+    // which lives inside the TLS secure context and is therefore replaced wholesale via
+    // setSecureContext) and the fingerprint pinning below it (`expected`). Missing either one
+    // means the new node is rejected -- by the handshake or by the explicit check -- so they are
+    // updated together here rather than by any caller.
+    // requestCert/rejectUnauthorized are server options, not part of the secure context, so
+    // replacing the context leaves the mutual-certificate requirement untouched.
+    addPeer: (name) => {
+      const certPem = loadPeerCert(name);
+      const fp = fingerprintOfCertPem(certPem);
+      if (expected.has(fp)) return false; // already known -- re-adding would duplicate the ca entry
+      peerCerts.push(certPem);
+      expected.set(fp, name);
+      server.setSecureContext({ key: me.key, cert: me.cert, ca: peerCerts, minVersion: 'TLSv1.3' });
+      log(`[net] "${name}" accepted as a peer (no restart needed)`);
+      return true;
+    },
+    knownPeers: () => Array.from(expected.values()),
     peers: () => Array.from(connected.keys()),
     isUp: (name) => connected.has(name),
     send: (name, msg) => {
@@ -169,11 +202,14 @@ function connectToHub({ selfName, hubName, host, port, onMessage, onOpen, onClos
   const expectedFp = fingerprintOfCertPem(hubCert);
   let socket = null;
   let stopped = false;
+  // Mutable so discovery can move this node to the hub's new address without a restart (see
+  // discovery.js). Read fresh on every connect attempt rather than captured once.
+  let currentHost = host;
 
   function connect() {
     if (stopped) return;
     socket = tls.connect({
-      host,
+      host: currentHost,
       port,
       key: me.key,
       cert: me.cert,
@@ -194,6 +230,11 @@ function connectToHub({ selfName, hubName, host, port, onMessage, onOpen, onClos
         socket.destroy();
         return;
       }
+      // The important half: this side is the one that has to notice a hub that went away, because
+      // it is the one that reconnects. Keepalive turns a silently dead peer into a real 'error'/
+      // 'close' event, which is what drives the retry below.
+      socket.setKeepAlive(true, KEEPALIVE_MS);
+
       log(`[net] connected to hub "${hubName}" (${socket.getProtocol()}, ${socket.getCipher().name})`);
       if (onOpen) onOpen();
     });
@@ -216,8 +257,22 @@ function connectToHub({ selfName, hubName, host, port, onMessage, onOpen, onClos
       if (socket && !socket.destroyed && socket.authorized) { sendMessage(socket, msg); return true; }
       return false;
     },
+    // Points this link at a different address and reconnects immediately. Dropping the old socket
+    // is the point: without it the node would keep waiting on a connection to an address that no
+    // longer exists, which is exactly the state a network change leaves it in.
+    setHost: (newHost) => {
+      if (!newHost || newHost === currentHost) return false;
+      currentHost = newHost;
+      if (socket) { try { socket.destroy(); } catch (e) {} }
+      return true;
+    },
+    getHost: () => currentHost,
+    isUp: () => !!(socket && !socket.destroyed && socket.authorized),
     stop: () => { stopped = true; if (socket) socket.destroy(); }
   };
 }
 
-module.exports = { startHub, connectToHub, fingerprintOfCertPem, loadPeerCert };
+// sendMessage/attachFraming/normalizeFp are exported for enrollment.js, which speaks the same
+// length-prefixed JSON framing over its own short-lived TLS listener. Deliberately reused rather
+// than reimplemented: a second, subtly different framing would be a second thing to get wrong.
+module.exports = { startHub, connectToHub, fingerprintOfCertPem, loadPeerCert, sendMessage, attachFraming, normalizeFp };

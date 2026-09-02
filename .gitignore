@@ -15,6 +15,9 @@ net-config.json
 .session*.json
 audio_out/
 presented_content/
+# Files a human handed to this agent -- personal by definition, and the one folder here most
+# likely to contain photos or documents that must never end up in a public repository.
+inbox/
 *.log
 *-log.txt
 restart-log.txt

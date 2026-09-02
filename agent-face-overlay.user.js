@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Agent Face Overlay
 // @namespace    agent-network
-// @version      1.0
+// @version      1.3
 // @description  Shared shell for all agent faces -- automatically loads its own face
 //               (faces/<name>.js from its own local overlay-server.js) on start and briefly
 //               switches to the face of ANOTHER agent when that agent is presenting here
@@ -11,6 +11,14 @@
 // @noframes
 // @grant        none
 // @run-at       document-idle
+// Served by this machine's own overlay-server.js, so Tampermonkey can pull new versions itself
+// ("check for userscript updates", or automatically) instead of the file having to be pasted in
+// by hand on every machine after every change. Bump @version above or the update is ignored --
+// Tampermonkey only replaces an installed script with a STRICTLY higher version number.
+// localhost on purpose: every machine serves its own copy, and this script only ever runs on a
+// machine that has its own overlay server (same reasoning as WS_URL below).
+// @updateURL    http://localhost:8787/agent-face-overlay.user.js
+// @downloadURL  http://localhost:8787/agent-face-overlay.user.js
 // ==/UserScript==
 
 (function () {
@@ -53,6 +61,62 @@
   const presentationFrame = document.createElement('iframe');
   presentationFrame.id = 'agent-presentation-frame';
   presentationFrame.style.display = 'none';
+
+  // -- Multi-slide presentations ---------------------------------------------------------------
+  // The presenting agent advances its own deck: it speaks one segment per slide (split on
+  // [SLIDE], see followup-tag.js) and the machine playing that audio raises state.presentation
+  // .slide between segments. Here that turns into a postMessage into the deck (see
+  // deck-runtime.js), NOT a reload -- re-pointing .src would restart the page and throw away
+  // anything the deck had going (a chart it drew, a video, scroll position).
+  //
+  // A message can only arrive after the iframe document exists, so a slide raised while the page
+  // is still loading has to be held back and flushed on 'load' -- otherwise the very common case
+  // of a short first segment (deck still loading when slide 2 comes due) would silently drop the
+  // first advance and leave the deck a slide behind for the rest of the presentation.
+  let deckFrameReady = false;
+  let pendingSlide = null;
+  let shownSlide = null;
+
+  function postSlide(index) {
+    try {
+      presentationFrame.contentWindow.postMessage({ type: 'agent-slide', index }, '*');
+    } catch (e) {
+      // Cross-origin or a frame torn down mid-flight -- a missed slide is not worth breaking
+      // applyState over, the narration keeps running either way.
+    }
+  }
+
+  function applySlide(rawIndex) {
+    const index = Number(rawIndex) || 0;
+    if (index === shownSlide) return;
+    shownSlide = index;
+    if (deckFrameReady) postSlide(index); else pendingSlide = index;
+  }
+
+  presentationFrame.addEventListener('load', () => {
+    deckFrameReady = true;
+    if (pendingSlide !== null) { postSlide(pendingSlide); pendingSlide = null; }
+  });
+
+  // Paging by hand once the agent has stopped talking. The deck brings its own keyboard handling,
+  // but it only ever sees a key press after someone has clicked INTO the iframe first -- the deck
+  // is cross-origin (it is served by whichever machine generated it, not by this page), so it
+  // cannot take focus for itself. Until then every arrow key goes to the host page instead and
+  // the deck looks broken. Forwarding from out here closes that gap: the keys work immediately,
+  // without the click nobody thinks to make.
+  // Only while a presentation is actually up -- otherwise this would swallow arrow keys on
+  // whatever ordinary page the overlay happens to be injected into.
+  document.addEventListener('keydown', (e) => {
+    if (presentationFrame.style.display === 'none') return;
+    const t = e.target;
+    if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || ''))) return;
+    let method = null;
+    if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') method = 'next';
+    else if (e.key === 'ArrowLeft' || e.key === 'PageUp') method = 'prev';
+    if (!method) return;
+    e.preventDefault();
+    try { presentationFrame.contentWindow.postMessage({ method }, '*'); } catch (err) {}
+  });
 
   // Shared stylesheet -- only what's identical across ALL faces (confirmed by diffing the former
   // Kai/Ava files: mic button, presentation iframe/.presenting, mouth-pixel animation variables,
@@ -151,7 +215,14 @@
   // present at once, plain CSS cascade order (not intent) would decide which one wins.
   const faceStyleEl = document.createElement('style');
 
+  // Printed on every page the overlay mounts on, so "which copy of this file is Tampermonkey
+  // actually running" is answerable in two seconds. An installed userscript does NOT update when
+  // the file on disk changes -- it has to be pasted in by hand -- and an out-of-date copy fails in
+  // ways that look like a backend bug (a deck that never advances, for instance).
+  const OVERLAY_VERSION = '1.3 (multi-slide, chat-safe)';
+
   function mount() {
+    console.log(`[agent-overlay] version ${OVERLAY_VERSION} active`);
     document.documentElement.appendChild(style);
     document.documentElement.appendChild(faceStyleEl);
     document.documentElement.appendChild(presentationFrame);
@@ -331,8 +402,24 @@
   let socket;
   function connect() {
     socket = new WebSocket(WS_URL);
+    // Announces which build of this file the browser is actually running, so the machine can be
+    // asked (http://localhost:8787/clients) instead of someone having to open Tampermonkey and
+    // read a version number off a dashboard. A client that reports nothing is an OUTDATED copy --
+    // that is the whole point: an installed userscript does not update when the file on disk
+    // changes, and a stale one fails silently in ways that look like a backend fault (a deck that
+    // never advances, most of a day spent looking in the wrong place, 2026-08-25).
+    socket.onopen = () => {
+      try { socket.send(JSON.stringify({ type: 'client-hello', version: OVERLAY_VERSION })); } catch (e) {}
+    };
     socket.onmessage = (ev) => {
-      try { applyState(JSON.parse(ev.data)); } catch (e) { /* ignore */ }
+      try {
+        const msg = JSON.parse(ev.data);
+        // Face state has no "type"; typed messages (the stage page's chat stream) are addressed to
+        // other subscribers. Without this guard one of those would be read as a state with no
+        // status and no presentation -- and would tear down a running presentation mid-sentence.
+        if (msg && msg.type) return;
+        applyState(msg);
+      } catch (e) { /* ignore */ }
     };
     socket.onclose = () => setTimeout(connect, 2000);
     socket.onerror = () => {};
@@ -506,11 +593,23 @@
     const presenting = !!(state.presentation && state.presentation.url);
     box.classList.toggle('presenting', presenting);
     if (presenting) {
-      if (presentationFrame.src !== state.presentation.url) presentationFrame.src = state.presentation.url;
+      if (presentationFrame.src !== state.presentation.url) {
+        presentationFrame.src = state.presentation.url;
+        // A fresh document starts on its own first slide and has no listener yet -- both flags
+        // have to go back to their initial state, or a leftover shownSlide from the PREVIOUS
+        // presentation would make applySlide() treat the new deck's slide 0 as "already shown".
+        deckFrameReady = false;
+        pendingSlide = null;
+        shownSlide = null;
+      }
       presentationFrame.style.display = '';
+      applySlide(state.presentation.slide);
     } else if (presentationFrame.style.display !== 'none') {
       presentationFrame.style.display = 'none';
       presentationFrame.src = 'about:blank'; // actually stop the content (could have its own audio/video), not just hide it
+      deckFrameReady = false;
+      pendingSlide = null;
+      shownSlide = null;
     }
 
     // Own face completely invisible while the reply is running on an ANOTHER screen (main-display

@@ -1,0 +1,287 @@
+/* deck-runtime.css
+   Styling for multi-slide presentations an agent writes into presented_content/. Served by every
+   machine's own overlay server at /deck.css (see overlay-server.js), so a generated deck only has
+   to link it and write plain <section> elements.
+
+   Deliberately NOT a copy of a framework like reveal.js: a deck has to render on a machine with
+   no internet access as a matter of principle (see the README), and a CDN link would be exactly
+   the kind of outbound request this project does not make. Everything here is plain CSS with no
+   build step and no dependency.
+
+   -- A FLOOR, NOT A CEILING ------------------------------------------------------------------
+   The first version of this file was too opinionated and every deck came out looking identical --
+   noticeably duller than the free-form single pages agents used to design themselves (reported
+   live: "die Präsentationen mit der einen Slide waren fast immer besser gemacht"). The split now
+   is deliberate:
+
+     - STRUCTURE (which slide is visible, sizing, overflow, the nav chrome) is normal-specificity
+       and meant to stay put -- that is mechanism, and a deck that overrides it breaks paging.
+     - LOOK (type, color, spacing) is wrapped in :where(), which has ZERO specificity. A deck's
+       own <style> block can therefore override any of it with a plain "h1 { ... }" -- no !important,
+       no fighting the cascade. Agents are expected to do this; see the presentation skill.
+
+   Every color also comes from a variable, so re-theming a whole deck is a few lines in :root. */
+
+:root {
+  --deck-bg: #0b0c10;
+  --deck-bg-accent: #12141b;      /* subtle depth behind the slide, override to flatten */
+  --deck-fg: #f2f4f8;
+  --deck-muted: #99a0ae;
+  --deck-accent: #7fd1e8;
+  --deck-line: #2b2e38;
+  --deck-surface: #171a21;        /* code blocks, chrome buttons */
+  --deck-pad: clamp(2.5rem, 6vw, 6rem);
+  --deck-font: "Segoe UI", -apple-system, Helvetica, Arial, sans-serif;
+  --deck-mono: "Cascadia Mono", Consolas, "Courier New", monospace;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  /* The deck fills an iframe that is exactly the viewport -- a scrollbar here would mean a slide
+     is overflowing, which .deck-slide's own overflow handling deals with instead. */
+  overflow: hidden;
+}
+
+/* The ground is painted on <html> only. Setting it on both meant the same gradient rendered twice,
+   once sized to the root and once to the body -- invisible in the result but wasteful, and it makes
+   an agent's own "body { background: ... }" look like it did nothing, because the root's gradient
+   is still sitting on top of the canvas. */
+:where(html) {
+  background: radial-gradient(ellipse at 50% 0%, var(--deck-bg-accent), var(--deck-bg) 70%);
+}
+
+:where(body) {
+  color: var(--deck-fg);
+  font-family: var(--deck-font);
+}
+
+.deck { height: 100%; }
+
+/* -- Structure (keep) -------------------------------------------------------------------------
+   Hidden slides stay in the DOM (display:none) rather than being detached: an agent-written deck
+   may contain anything, and re-parenting nodes on every slide change would break, say, a running
+   <video> or a canvas the page set up on load. */
+.deck-slide {
+  display: none;
+  height: 100%;
+  /* A slide with more content than fits scrolls on its own instead of being silently cut off --
+     an agent cannot know the display's resolution in advance. */
+  overflow-y: auto;
+}
+
+.deck-slide.deck-active { display: flex; }
+
+:where(.deck-slide) {
+  padding: var(--deck-pad);
+  flex-direction: column;
+  justify-content: center;
+  gap: 1.15rem;
+  animation: deck-in 300ms cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+@keyframes deck-in {
+  from { opacity: 0; transform: translateY(14px); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .deck-slide { animation: none; }
+}
+
+/* -- Look (all overridable) -------------------------------------------------------------------
+   Only bare element selectors inside :where(), no classes an agent would have to remember: a deck
+   written as plain <h1>/<p>/<ul> markup already looks right, and a deck that wants its own look
+   just writes ordinary CSS and wins on source order. */
+
+:where(.deck-slide h1) {
+  margin: 0;
+  font-size: clamp(2.4rem, 5.5vw, 4.5rem);
+  line-height: 1.05;
+  letter-spacing: -0.025em;
+  text-wrap: balance;
+}
+
+:where(.deck-slide h2) {
+  margin: 0;
+  font-size: clamp(1.8rem, 3.6vw, 3rem);
+  line-height: 1.15;
+  letter-spacing: -0.015em;
+  text-wrap: balance;
+}
+
+/* The small eyebrow above a heading -- the one piece of visual structure worth having by default,
+   because it gives a slide a "where am I" line without costing the agent any markup thought. */
+:where(.deck-slide h3) {
+  margin: 0 0 -0.4rem 0;
+  font-size: clamp(0.8rem, 1.15vw, 1rem);
+  color: var(--deck-accent);
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+:where(.deck-slide p, .deck-slide li) {
+  margin: 0;
+  font-size: clamp(1.05rem, 1.9vw, 1.7rem);
+  line-height: 1.5;
+  max-width: 36ch;
+}
+
+:where(.deck-slide ul, .deck-slide ol) {
+  margin: 0;
+  padding-left: 1.3em;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+:where(.deck-slide li)::marker { color: var(--deck-accent); }
+
+:where(.deck-slide strong) { color: #fff; font-weight: 650; }
+:where(.deck-slide em) { color: var(--deck-accent); font-style: normal; }
+:where(.deck-slide a) { color: var(--deck-accent); }
+
+:where(.deck-slide code, .deck-slide pre) {
+  font-family: var(--deck-mono);
+  background: var(--deck-surface);
+  border: 1px solid var(--deck-line);
+  border-radius: 6px;
+}
+
+:where(.deck-slide code) { padding: 0.1em 0.35em; font-size: 0.85em; }
+
+:where(.deck-slide pre) {
+  padding: 1rem 1.2rem;
+  overflow-x: auto;
+  font-size: clamp(0.8rem, 1.2vw, 1.05rem);
+  line-height: 1.5;
+}
+
+:where(.deck-slide pre code) { background: none; border: 0; padding: 0; font-size: inherit; }
+
+:where(.deck-slide blockquote) {
+  margin: 0;
+  padding-left: 1.2rem;
+  border-left: 3px solid var(--deck-accent);
+  color: var(--deck-muted);
+}
+
+/* Structural, not cosmetic: without the height cap a tall image pushes the rest of the slide
+   off-screen instead of shrinking, which is the failure you get from dropping a photo into a
+   slide. Kept at normal specificity on purpose. */
+.deck-slide img,
+.deck-slide svg,
+.deck-slide canvas {
+  max-width: 100%;
+  max-height: 55vh;
+}
+
+:where(.deck-slide img, .deck-slide svg, .deck-slide canvas) { object-fit: contain; }
+
+:where(.deck-slide table) {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: clamp(0.9rem, 1.45vw, 1.25rem);
+  /* Figures in a column only read as a column when their digits line up. */
+  font-variant-numeric: tabular-nums;
+}
+
+:where(.deck-slide th, .deck-slide td) {
+  padding: 0.55em 0.8em;
+  text-align: left;
+  border-bottom: 1px solid var(--deck-line);
+}
+
+:where(.deck-slide th) {
+  color: var(--deck-muted);
+  font-weight: 600;
+  font-size: 0.78em;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* A centered title screen instead of the default left-aligned body. */
+.deck-slide.deck-title { align-items: center; justify-content: center; }
+:where(.deck-slide.deck-title) { text-align: center; }
+:where(.deck-slide.deck-title p) { max-width: 48ch; color: var(--deck-muted); }
+
+/* -- Chrome: progress, counter, arrows -------------------------------------------------------- */
+
+.deck-progress {
+  position: fixed;
+  left: 0; top: 0; right: 0;
+  height: 3px;
+  background: var(--deck-line);
+  z-index: 10;
+}
+
+.deck-progress-bar {
+  height: 100%;
+  width: 0;
+  background: var(--deck-accent);
+  transition: width 300ms ease-out;
+}
+
+.deck-counter {
+  position: fixed;
+  right: 1.6rem;
+  bottom: 1.4rem;
+  z-index: 10;
+  font-size: 0.9rem;
+  letter-spacing: 0.1em;
+  color: var(--deck-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Visible, not decorative. Two earlier passes at this were too discreet -- at 0.25 and then 0.6
+   opacity the arrows were reported as not findable on a real screen across the room, twice. They
+   are the only affordance telling someone the deck can be paged by hand at all, so they now read
+   as actual buttons and only dim slightly when untouched. */
+.deck-nav {
+  position: fixed;
+  left: 1.6rem;
+  bottom: 1.2rem;
+  z-index: 10;
+  display: flex;
+  gap: 0.6rem;
+  opacity: 0.9;
+  transition: opacity 200ms ease-out;
+}
+
+.deck-nav:hover,
+.deck-nav:focus-within { opacity: 1; }
+
+.deck-nav button {
+  width: 3.1rem;
+  height: 3.1rem;
+  border-radius: 50%;
+  border: 1px solid var(--deck-accent);
+  background: var(--deck-surface);
+  color: var(--deck-accent);
+  font-size: 1.3rem;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 14px rgba(0, 0, 0, 0.45);
+  transition: transform 150ms, background 150ms, color 150ms;
+}
+
+.deck-nav button:hover:not(:disabled) {
+  background: var(--deck-accent);
+  color: var(--deck-bg);
+  transform: scale(1.06);
+}
+
+.deck-nav button:focus-visible { outline: 2px solid var(--deck-accent); outline-offset: 3px; }
+
+.deck-nav button:disabled {
+  opacity: 0.3;
+  cursor: default;
+  border-color: var(--deck-line);
+  color: var(--deck-muted);
+}

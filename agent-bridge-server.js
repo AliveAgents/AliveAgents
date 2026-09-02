@@ -19,10 +19,13 @@ const spawn = require('cross-spawn');
 const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
-const { startHub } = require('./agent-net.js');
+const { startHub, fingerprintOfCertPem, loadPeerCert } = require('./agent-net.js');
+const { startHubBeacon } = require('./discovery.js');
 const { createSpeaker } = require('./speech.js');
-const { startOverlayServer, getLanIp } = require('./overlay-server.js');
-const { extractFollowUpTag, buildTagHint, buildPeersLine, extractPresentationTag } = require('./followup-tag.js');
+const { startOverlayServer, getLanIp, contentUrlPrefix, localizeContentUrl } = require('./overlay-server.js');
+const { extractFollowUpTag, buildTagHint, buildPeersLine, extractPresentationTag, splitSlideSegments, extractProvisionTag } = require('./followup-tag.js');
+const enrollmentLib = require('./enrollment.js');
+const inboxLib = require('./inbox.js');
 
 // Spawn the real claude.exe directly instead of the bare 'claude' command whenever the bundled
 // portable install is present. On Windows, 'claude' resolves to claude.cmd, and spawning a .cmd
@@ -44,8 +47,30 @@ const CLAUDE_EXE = (() => {
 const PORT = Number(process.env.AGENT_BRIDGE_PORT) || 8787;
 // This agent's own reachable base URL for self-generated presentation content
 // (presented_content/, see the buildTagHint calls below) -- computed once, never changes at runtime.
-const CONTENT_URL_PREFIX = `http://${getLanIp()}:${PORT}`;
+// Includes the per-process content key (see serveContent in overlay-server.js) -- without it the
+// generated presentation would be refused, including to the machine meant to display it.
+const CONTENT_URL_PREFIX = contentUrlPrefix(`http://${getLanIp()}:${PORT}`);
 const SESSION_FILE = process.env.AGENT_SESSION_FILE || path.join(__dirname, '.session.json');
+
+// Loaded up here rather than only where the hub starts (bottom of the file): provisioning needs
+// the hub's own name and port while building a config for a joining machine, and that code is
+// evaluated at module load. One read, one source of truth.
+// See the same helper in node-agent.js: a UTF-8 byte order mark makes JSON.parse throw, and both
+// Notepad and PowerShell 5.1's "Set-Content -Encoding UTF8" write one. Costs nothing to tolerate.
+function readJsonFile(file) {
+  return JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, ''));
+}
+
+const NET_CONFIG_FILE = process.env.AGENT_NET_CONFIG || path.join(__dirname, 'net-config.json');
+let netConfig = null;
+if (fs.existsSync(NET_CONFIG_FILE)) {
+  try {
+    netConfig = readJsonFile(NET_CONFIG_FILE);
+  } catch (e) {
+    console.error(`[net] ${NET_CONFIG_FILE} is not valid JSON: ${e.message}`);
+  }
+}
+const NET_PORT = (netConfig && netConfig.port) || 8788;
 
 const AGENT = {
   name: 'Oscar',
@@ -421,6 +446,12 @@ function onSpeechFinished(myRequestId, answererName, answerText, suggestedNext =
   // ran from when the task was SENT, not from the actual END of the reply -- for a remote agent
   // with a noticeable thinking/speaking time (e.g. higher effort), this effectively left less
   // than 30s for a natural follow-up question, sometimes none at all.
+  // The one place every finished reply passes through, whoever gave it -- so the chat transcript
+  // is fed from here rather than from each agent's own path. A remote agent's text otherwise never
+  // reaches this browser at all (it speaks on its own machine), which is exactly why typing to
+  // Nova would previously have looked like it went nowhere.
+  overlay.pushChat({ agent: answererName, from: 'agent', text: answerText });
+
   const info = answererName === AGENT.name ? null : remoteAgents.get(answererName);
   rememberRouted(answererName, info ? info.nodeName : null);
   // Give the browser overlay the authoritative point in time, instead of it having to guess from
@@ -516,7 +547,18 @@ let sessionId = loadSessionId();
 
 const overlay = startOverlayServer({
   port: PORT,
-  onUserInput: (text) => askAgent(text) // ONLY Oscar's overlay passes microphone input through
+  // ONLY Oscar's overlay passes input through. targetAgent is set when it came from a per-agent
+  // chat box on the stage page; the microphone leaves it null and routing works as it always has.
+  onUserInput: (text, targetAgent) => askAgent(text, targetAgent),
+  // Powers the file-drop page at /files. Hub-only -- a node knows neither the roster nor how to
+  // route a file to somebody else.
+  getAgents: () => [
+    { name: AGENT.name, domain: 'Coordinator — everything that has no clearer owner.', online: true },
+    ...Array.from(remoteAgents.entries()).map(([name, info]) => ({
+      name, domain: info.domain || '', online: !!(hub && hub.isUp(info.nodeName))
+    }))
+  ],
+  onFileUpload: (agentName, fileName, buffer) => deliverFile(agentName, fileName, buffer)
 });
 
 // Thin wrapper around overlay.setState: ALWAYS attaches the list of all currently valid agent
@@ -598,17 +640,66 @@ function routeToAgent(target, userText, myRequestId) {
 // he himself is the presenter (presentFromOscar, no network hop needed) or a remote agent
 // sends him something to display (the present-request handler further below). Mirrors the
 // 'present' handler in node-agent.js, just without the detour through hub.send/link.send.
-function playPresentationLocally(filePath, agentName, url, text, presoRequestId, suggestedNext, faceStyle) {
+// Reads the audio out of a 'present'/'present-request' message. Accepts BOTH the current shape
+// (segments[]) and the older single-blob audioBase64 -- deliberately, so a machine still running
+// an outdated copy of the project degrades to a working single-slide presentation instead of
+// having its message silently ignored by the guard. Mirrored in node-agent.js.
+// Returns null if there is no usable audio at all.
+function normalizePresentSegments(msg) {
+  if (Array.isArray(msg.segments) && msg.segments.length) {
+    const usable = msg.segments.filter((s) => s && typeof s.audioBase64 === 'string');
+    if (usable.length) return usable.map((s) => ({ audioBase64: s.audioBase64, text: typeof s.text === 'string' ? s.text : '' }));
+  }
+  if (typeof msg.audioBase64 === 'string') {
+    return [{ audioBase64: msg.audioBase64, text: typeof msg.text === 'string' ? msg.text : '' }];
+  }
+  return null;
+}
+
+// Writes each segment's audio to its own file under audio_out/. Returns null (having cleaned up
+// whatever was already written) if any of them fails, so callers get an all-or-nothing result.
+function writeSegmentFiles(wireSegments) {
+  const written = [];
+  try {
+    wireSegments.forEach((s, i) => {
+      const filePath = path.join(__dirname, 'audio_out', `present-${Date.now()}-${i}.wav`);
+      fs.writeFileSync(filePath, Buffer.from(s.audioBase64, 'base64'));
+      written.push({ filePath, text: s.text });
+    });
+    return written;
+  } catch (e) {
+    console.error('[maindisplay] Could not write audio data:', e.message);
+    for (const s of written) fs.unlink(s.filePath, () => {});
+    return null;
+  }
+}
+
+// segments: [{ filePath, text }] -- one entry per slide. A single-slide presentation is just the
+// one-element case, so there is no separate code path for it.
+function playPresentationLocally(segments, agentName, url, text, presoRequestId, suggestedNext, faceStyle) {
   const deliver = () => {
-    currentPresentation = { agentName, url, faceStyle };
+    currentPresentation = { agentName, url, faceStyle, slide: 0 };
     presentationOwnerRequestId = presoRequestId;
-    setOverlayState({ status: 'speaking', text, agent: AGENT.name });
-    speaker.playLocally(filePath, () => {
-      fs.unlink(filePath, () => {});
+    setOverlayState({ status: 'speaking', text: segments[0].text, agent: AGENT.name });
+    speaker.playSequence(segments.map((s) => s.filePath), (index) => {
+      // Runs in the pause BEFORE each segment starts (see playSequence in speech.js) -- index 0
+      // is already on screen from deliver() above, so only later slides are an actual change.
+      // The staleness check matters here specifically: unlike a single blob, this callback fires
+      // repeatedly over the whole presentation, so a newer chain could have taken the screen in
+      // between -- without it, this one would keep flipping slides underneath the new owner.
+      // !currentPresentation guards the same case found live on the node side: clearDisplay()
+      // nulls this while the audio for the PREVIOUS presentation is still playing, and
+      // Object.assign({}, null, {slide}) would rebuild a bogus presentation with a slide number
+      // but no url -- which the overlay reads as "nothing is presented" and tears down.
+      if (index === 0 || presoRequestId !== presentationOwnerRequestId || !currentPresentation) return;
+      currentPresentation = Object.assign({}, currentPresentation, { slide: index });
+      setOverlayState({ status: 'speaking', text: segments[index].text, agent: AGENT.name });
+    }, () => {
       // currentPresentation is DELIBERATELY left in place here (user's wish: the presentation
       // stays up until the next genuinely new user input) -- only clearDisplay() still cleans
       // that up. Only status/text go back to idle, setOverlayState() still keeps carrying
-      // currentPresentation along regardless.
+      // currentPresentation along regardless. The deck also stays on its LAST slide, which is
+      // what makes clicking back through it by hand afterwards work.
       if (presoRequestId === presentationOwnerRequestId) {
         setOverlayState({ status: 'idle', text: '', agent: AGENT.name });
       }
@@ -631,43 +722,66 @@ function playPresentationLocally(filePath, agentName, url, text, presoRequestId,
 // hub is itself the main display -- there is no TLS connection to itself, so no network hop is
 // possible) or forwarded via hub.send to the responsible node, while Oscar's own overlay jumps
 // to idle (same principle as routeToAgent).
-function presentFromOscar(text, myRequestId, url, suggestedNext) {
-  speaker.synthesizeSpeech(text, (filePath) => {
+// slideTexts: one spoken segment per slide (see splitSlideSegments) -- a single-slide
+// presentation is the one-element case, no separate path.
+function presentFromOscar(slideTexts, myRequestId, url, suggestedNext) {
+  const text = slideTexts.join(' ');
+  speaker.synthesizeAll(slideTexts, (filePaths) => {
     if (myRequestId !== activeRequestByTarget.get(HUB_TARGET)) {
-      if (filePath) fs.unlink(filePath, () => {});
+      if (filePaths) for (const f of filePaths) fs.unlink(f, () => {});
       cleanupFollowUp(myRequestId);
       return;
     }
-    if (!filePath) {
+    if (!filePaths) {
       // Piper unavailable -- no reliable "done" point for a presentation, falls back to normal
       // (browser) speech instead of attempting a broken presentation.
       say(text, myRequestId, AGENT.name, true, suggestedNext);
       return;
     }
+    const segments = filePaths.map((filePath, i) => ({ filePath, text: slideTexts[i] }));
+    // mainDisplayTarget is re-checked HERE, not just before the call: synthesis is asynchronous,
+    // and "/maindisplay" or a node dropping off can null it out in the meantime -- which would
+    // make the .nodeName read below a TypeError that takes the whole hub down. Always a latent
+    // risk, but a real one since a multi-slide deck synthesizes N segments instead of one and the
+    // window is now seconds rather than a moment.
+    if (!mainDisplayTarget) {
+      console.log('[maindisplay] Main display went away during synthesis -- speaking normally.');
+      for (const s of segments) fs.unlink(s.filePath, () => {});
+      say(text, myRequestId, AGENT.name, true, suggestedNext);
+      return;
+    }
     if (mainDisplayTarget.nodeName === null) {
-      playPresentationLocally(filePath, AGENT.name, url, text, myRequestId, suggestedNext, AGENT.faceStyle);
+      playPresentationLocally(segments, AGENT.name, url, text, myRequestId, suggestedNext, AGENT.faceStyle);
       return;
     }
     // ownDisplayHidden: Oscar's own overlay hides completely (not just idle) while the reply
     // is running on the FOREIGN main-display screen -- otherwise you'd see an idle face standing
     // around here while the actual reply happens elsewhere.
     setOverlayState({ status: 'idle', text: '', agent: AGENT.name, ownDisplayHidden: true });
-    let audioBase64;
+    let wireSegments;
     try {
-      audioBase64 = fs.readFileSync(filePath).toString('base64');
+      wireSegments = segments.map((s) => ({ audioBase64: fs.readFileSync(s.filePath).toString('base64'), text: s.text }));
     } catch (e) {
       console.error('[maindisplay] Audio file unreadable, speaking normally instead:', e.message);
       say(text, myRequestId, AGENT.name, true, suggestedNext);
       return;
     }
-    fs.unlink(filePath, () => {});
+    for (const s of segments) fs.unlink(s.filePath, () => {});
     const deliver = () => {
       try {
         pendingPresentationSuggested.set(myRequestId, suggestedNext);
         presentationOwnerRequestId = myRequestId;
-        currentPresentation = { agentName: AGENT.name, url, faceStyle: AGENT.faceStyle };
-        hub.send(mainDisplayTarget.nodeName, { type: 'present', requestId: myRequestId, agentName: AGENT.name, url, audioBase64, text, faceStyle: AGENT.faceStyle });
-        console.log(`[maindisplay] Oscar is presenting on "${mainDisplayTarget.agentName}": ${url}`);
+        currentPresentation = { agentName: AGENT.name, url, faceStyle: AGENT.faceStyle, slide: 0 };
+        // audioBase64 is only set for the single-slide case: it costs nothing there (same string,
+        // one segment) and keeps a node running an older copy of the project working, since that
+        // is the shape it expects. A multi-slide deck genuinely needs the new node code anyway,
+        // so duplicating the first segment's audio into it would just inflate the message.
+        hub.send(mainDisplayTarget.nodeName, {
+          type: 'present', requestId: myRequestId, agentName: AGENT.name, url, text, faceStyle: AGENT.faceStyle,
+          segments: wireSegments,
+          audioBase64: wireSegments.length === 1 ? wireSegments[0].audioBase64 : undefined
+        });
+        console.log(`[maindisplay] Oscar is presenting on "${mainDisplayTarget.agentName}"${wireSegments.length > 1 ? ` (${wireSegments.length} slides)` : ''}: ${url}`);
       } catch (e) {
         // e.g. MAX_MSG_BYTES exceeded or the connection just dropped -- avoid crashing (see
         // agent-net.js), fall back to speaking normally instead of letting the reply silently vanish.
@@ -684,6 +798,137 @@ function presentFromOscar(text, myRequestId, url, suggestedNext) {
     }
     deliver();
   });
+}
+
+// -- Files handed to an agent ------------------------------------------------------------------
+// Comes from the drop page at /files (hub machine only). Oscar's own files are written straight to
+// disk; everyone else's are pushed over the existing mTLS link, chunked, because a photo easily
+// exceeds one frame. Deliberately pushed rather than fetched over HTTP the way presentations are:
+// a slide deck is meant to be seen, a file someone handed to one agent is not.
+function deliverFile(agentName, fileName, buffer) {
+  if (agentName === AGENT.name) {
+    const dir = inboxLib.ensureInbox(__dirname);
+    const target = path.join(dir, inboxLib.safeName(fileName));
+    // uniquePath lives in inbox.js for the receive path; here the same rule is applied by letting
+    // the receiver helper do it -- keeps "never overwrite" in one place.
+    const receiver = inboxLib.createReceiver({ root: __dirname, log: console.log, onComplete: (n) => { newInboxFiles.add(n); } });
+    const id = 'local-' + Date.now();
+    receiver.begin({ transferId: id, name: fileName, size: buffer.length, total: 1 });
+    receiver.chunk({ transferId: id, data: buffer.toString('base64') });
+    receiver.end({ transferId: id });
+    return { ok: true, target: path.basename(target) };
+  }
+  const info = remoteAgents.get(agentName);
+  if (!info) return { ok: false, error: `unknown agent "${agentName}"` };
+  if (!hub || !hub.isUp(info.nodeName)) return { ok: false, error: `${agentName} is offline` };
+  inboxLib.sendFile((msg) => {
+    if (!hub.send(info.nodeName, msg)) throw new Error('connection dropped mid-transfer');
+  }, { name: fileName, buffer, agentName });
+  console.log(`[inbox] sent "${fileName}" (${inboxLib.humanSize(buffer.length)}) to ${agentName}`);
+  return { ok: true };
+}
+
+// Names that arrived since Oscar's last reply, so they can be marked [NEW] exactly once.
+const newInboxFiles = new Set();
+
+// -- Provisioning a new agent ------------------------------------------------------------------
+// Oscar drives the conversation (see the "new-agent" skill) and names the intent via a
+// [PROVISION: {...}] marker; everything that actually touches keys, certificates or config
+// happens HERE, in the hub process. Oscar gains no new tool permissions from any of this -- it
+// still runs with PowerShell disallowed and write access limited to presented_content/.
+const ENROLL_PORT = Number(process.env.AGENT_ENROLL_PORT) || (NET_PORT + 1);
+let enrollment = null; // the currently open window, or null
+
+// Piper reads "K7QF-2M9X-BTLR" as a word-like blob. Spelling it out with separators forces the pauses
+// that make it transcribable by ear, which is the only channel the code travels over.
+function speakableCode(code) {
+  return code.split('').map((c) => (c === '-' ? 'dash' : c)).join('. ') + '.';
+}
+
+// Everything the new machine needs to run, assembled from what Oscar collected plus what only the
+// hub knows (its own name, its LAN address, the ports).
+function buildNodeConfig(name, wanted) {
+  const cfg = {
+    _comment: `Generated by ${AGENT.name} during enrollment on ${new Date().toISOString().slice(0, 10)}.`,
+    self: name,
+    role: 'node',
+    hubName: netConfig.self,
+    hubHost: getLanIp(),
+    hubPort: NET_PORT,
+    agentName: wanted.agentName || (name.charAt(0).toUpperCase() + name.slice(1)),
+    piperVoice: wanted.piperVoice || 'en_US-ljspeech-high.onnx',
+    overlayPort: 8787,
+    domain: wanted.domain || '',
+    personality: wanted.personality || 'Direct and pragmatic, answering in 1-3 short, chat-style sentences.',
+    faceStyle: wanted.faceStyle || 'ava',
+    mainDisplay: false
+  };
+  // Only carried over when explicitly asked for -- these widen what the new agent may do, so they
+  // should never appear by accident.
+  for (const k of ['effort', 'allowedTools', 'permissionMode', 'mcpConfig', 'chrome']) {
+    if (wanted[k] !== undefined) cfg[k] = wanted[k];
+  }
+  return cfg;
+}
+
+// Persists the new peer into the hub's own net-config.json, so it survives a restart. The runtime
+// side (hub.addPeer) is what makes it work WITHOUT one.
+function persistPeer(name) {
+  const raw = readJsonFile(NET_CONFIG_FILE);
+  raw.peers = Array.isArray(raw.peers) ? raw.peers : [];
+  if (!raw.peers.includes(name)) {
+    raw.peers.push(name);
+    fs.writeFileSync(NET_CONFIG_FILE, JSON.stringify(raw, null, 2) + '\n');
+  }
+  // Keep the in-memory copy in step, so a later provisioning in the same session sees it too.
+  netConfig.peers = raw.peers;
+}
+
+// Returns { error } when nothing was started, or { code, name } once the window is open.
+function startProvisioning(wanted) {
+  if (!netConfig || netConfig.role !== 'hub') {
+    return { error: 'This machine is not the hub, so it cannot enroll anyone.' };
+  }
+  if (wanted._malformed) {
+    return { error: 'I garbled the setup details. Could you say that again?' };
+  }
+  const name = String(wanted.self || '').toLowerCase().trim();
+  if (!enrollmentLib.isValidName(name)) {
+    return { error: `I can't use "${wanted.self || ''}" as an agent name. It needs lowercase letters, digits, dashes or underscores.` };
+  }
+  if (enrollment && enrollment.isOpen()) {
+    return { error: 'There is already an enrollment window open. Let that one finish or expire first.' };
+  }
+  if (fs.existsSync(path.join(__dirname, 'certs', `${name}-cert.pem`))) {
+    return { error: `An agent called "${name}" already exists on this network. Pick a different name.` };
+  }
+  const code = enrollmentLib.generateCode();
+  try {
+    enrollment = enrollmentLib.startEnrollmentListener({
+      selfName: netConfig.self,
+      certDir: path.join(__dirname, 'certs'),
+      port: ENROLL_PORT,
+      code,
+      expectedName: name,
+      buildConfig: (n) => buildNodeConfig(n, wanted),
+      onEnrolled: (n) => {
+        persistPeer(n);
+        if (hub) hub.addPeer(n);
+      },
+      onClosed: () => { enrollment = null; }
+    });
+  } catch (e) {
+    console.error('[enroll] could not open the enrollment window:', e.message);
+    return { error: 'I could not open the enrollment window. The console has the details.' };
+  }
+  // The console is the reliable channel -- speech recognition of a code is not something to rely
+  // on, and this is printed where it can be read and retyped exactly.
+  console.log('');
+  console.log(`  Enrolling a new agent: "${name}"`);
+  console.log(`  On the NEW machine run:   enroll.bat ${getLanIp()} ${code}`);
+  console.log(`  Valid for ${enrollmentLib.ENROLL_TIMEOUT_MS / 60000} minutes, ${enrollmentLib.MAX_ATTEMPTS} attempts.`);
+  console.log('');
+  return { code, name };
 }
 
 // Sets the main display by hand -- this is the actual "low effort" way to reassign the role (no
@@ -746,13 +991,20 @@ function askOscarDirectly(userText, myRequestId) {
   const hasMainDisplay = mainDisplayTarget !== null;
   const tagHint = buildTagHint(hasMainDisplay, CONTENT_URL_PREFIX);
 
+  // Rebuilt from the folder every turn (not from a pending list), so files the agent moved or
+  // deleted last turn simply stop being mentioned. Goes into the MESSAGE, not the system prompt:
+  // it is a fact about right now, like peersLine -- not a standing behavioural rule.
+  const inboxFiles = inboxLib.listInbox(__dirname);
+  const inboxLine = inboxLib.buildInboxLine(inboxFiles, newInboxFiles);
+  newInboxFiles.clear();
+
   const args = ['-p'];
   if (sessionId) {
-    args.push(`${userText} ${peersLine}`.replace(/\s+/g, ' ').trim(), '--resume', sessionId);
+    args.push(`${userText} ${peersLine} ${inboxLine}`.replace(/\s+/g, ' ').trim(), '--resume', sessionId);
   } else {
     // No embedded \n here: Windows splits command-line arguments at real line breaks, which
     // previously truncated the message and broke the JSON output.
-    const persona = `You are ${AGENT.name}, the central coordinator of a network of AI assistant colleagues. ${peersLine} ${AGENT.personality} Message: ${userText}`
+    const persona = `You are ${AGENT.name}, the central coordinator of a network of AI assistant colleagues. ${peersLine} ${AGENT.personality} ${inboxLine} Message: ${userText}`
       .replace(/\s+/g, ' ').trim();
     args.push(persona);
   }
@@ -771,7 +1023,15 @@ function askOscarDirectly(userText, myRequestId) {
   // covers Write too). ALWAYS appended, independent of AGENT.allowedTools, not instead of it --
   // this also applies to Oscar, who deliberately has no write access otherwise, but scoped
   // narrowly enough (verified: writing outside the folder remains refused).
-  const allowedTools = AGENT.allowedTools ? `${AGENT.allowedTools},Edit(presented_content/**)` : 'Edit(presented_content/**)';
+  // "Skill" is in the same always-appended group: without it the project's own skills (see
+  // .claude/skills/, e.g. the multi-slide "presentation" one) are discovered but cannot actually
+  // be invoked once --allowedTools narrows the set. Costs nothing when no skill fits -- the model
+  // only pulls one in when it decides the situation calls for it.
+  // Edit(inbox/**) so an agent can act on what it was handed -- move, rename, tidy up -- not just
+  // read it. Read access needs no grant (verified live: a restricted agent describes a dropped
+  // image correctly), so this is only about writing.
+  const baseTools = 'Edit(presented_content/**),Edit(inbox/**),Skill';
+  const allowedTools = AGENT.allowedTools ? `${AGENT.allowedTools},${baseTools}` : baseTools;
   args.push('--allowedTools', allowedTools);
   if (AGENT.mcpConfig) args.push('--mcp-config', AGENT.mcpConfig);
   if (AGENT.permissionMode) args.push('--permission-mode', AGENT.permissionMode);
@@ -832,24 +1092,49 @@ function askOscarDirectly(userText, myRequestId) {
     }
     // The presentation marker is extracted FIRST (it's the outermost one, see followup-tag.js),
     // FORWARD only afterward on the rest -- so Oscar can combine both in a single reply.
-    const { cleanText: afterPresentation, presentationUrl } = extractPresentationTag(text);
-    const { cleanText, suggested } = extractFollowUpTag(afterPresentation);
+    const { cleanText: afterPresentation, presentationUrl: rawPresentationUrl } = extractPresentationTag(text);
+    // Rebuilt from the CURRENT base whenever it points at one of our own files -- an agent's
+    // session history is full of older base URLs and it reproduces those, address and all.
+    const presentationUrl = rawPresentationUrl ? localizeContentUrl(rawPresentationUrl, `http://${getLanIp()}:${PORT}`) : rawPresentationUrl;
+    if (rawPresentationUrl && presentationUrl !== rawPresentationUrl) {
+      console.log(`[maindisplay] corrected a stale content URL: ${rawPresentationUrl}`);
+    }
+    // Before FORWARD, for the same reason PRESENTATION is: FORWARD's regex is end-anchored, so a
+    // marker sitting after it would make that extraction miss.
+    const { cleanText: afterProvision, provision } = extractProvisionTag(afterPresentation);
+    const { cleanText, suggested } = extractFollowUpTag(afterProvision);
+    // Split unconditionally, not only when actually presenting: a [SLIDE] marker that survived
+    // into the TTS would be read out loud ("bracket slide"). Rejoining the segments is what the
+    // non-presenting paths below speak, so a stray marker simply disappears.
+    const slideSegments = splitSlideSegments(cleanText);
+    const spokenText = slideSegments.join(' ');
     // See the same line in node-agent.js: shows the RAW marker before any check, otherwise
     // "nothing attempted" can't be told apart from "attempted, but discarded".
     console.log(`[${AGENT.name}] Marker in raw text: ${suggested.length ? suggested.join(', ') : '(none)'}`);
-    console.log(`[${AGENT.name}] Presentation marker: ${presentationUrl || '(none)'}`);
+    console.log(`[${AGENT.name}] Presentation marker: ${presentationUrl || '(none)'}${slideSegments.length > 1 ? `, ${slideSegments.length} slides` : ''}`);
+    // Provisioning is handled before presenting: it changes what Oscar has to SAY (the pairing
+    // code has to be read out, and only the hub knows it -- the model cannot have put it in its
+    // own reply), so the spoken text is rewritten here before it reaches synthesis.
+    if (provision) {
+      const res = startProvisioning(provision);
+      const extra = res.error
+        ? ` ${res.error}`
+        : ` Your pairing code is: ${speakableCode(res.code)} It is also printed on my console, and it is valid for ${enrollmentLib.ENROLL_TIMEOUT_MS / 60000} minutes. On the new machine, run enroll dot bat with my address and that code.`;
+      say((spokenText + extra).trim(), myRequestId, AGENT.name, true, suggested);
+      return;
+    }
     if (presentationUrl) {
       if (mainDisplayTarget) {
-        presentFromOscar(cleanText, myRequestId, presentationUrl, suggested);
+        presentFromOscar(slideSegments, myRequestId, presentationUrl, suggested);
         return;
       }
       console.log('[maindisplay] Presentation requested, but no main display assigned -- speaking normally.');
     }
-    say(cleanText, myRequestId, AGENT.name, true, suggested);
+    say(spokenText, myRequestId, AGENT.name, true, suggested);
   });
 }
 
-function askAgent(userText) {
+function askAgent(userText, targetAgent = null) {
   if (userText === '/reset') {
     sessionId = null;
     try { fs.unlinkSync(SESSION_FILE); } catch (e) {}
@@ -876,8 +1161,42 @@ function askAgent(userText) {
     setMainDisplay(userText.slice('/maindisplay '.length).trim());
     return;
   }
+  // The same operation Oscar triggers via [PROVISION: ...], reachable by hand -- useful when the
+  // microphone is not the convenient way in, and as the fallback if a spoken setup goes sideways.
+  if (userText.startsWith('/provision ')) {
+    const res = startProvisioning({ self: userText.slice('/provision '.length).trim() });
+    if (res.error) console.log(res.error);
+    return;
+  }
+  if (userText === '/provision') {
+    console.log('Usage: /provision <name>   (lowercase, e.g. "ada")');
+    return;
+  }
 
   const myRequestId = ++requestId;
+
+  // Typed straight into one agent's chat box: no name matching, no classification, no follow-up
+  // window -- the recipient was already chosen by clicking on them. Falls through to normal
+  // routing if that agent is not reachable, so a stale panel cannot swallow the message.
+  if (targetAgent) {
+    overlay.pushChat({ agent: targetAgent, from: 'you', text: userText });
+    if (targetAgent === AGENT.name) {
+      clearDisplay();
+      originalQuestionByRequest.set(myRequestId, userText);
+      askOscarDirectly(userText, myRequestId);
+      return;
+    }
+    const info = remoteAgents.get(targetAgent);
+    if (info && hub && hub.isUp(info.nodeName)) {
+      clearDisplay();
+      originalQuestionByRequest.set(myRequestId, userText);
+      routeToAgent({ agentName: targetAgent, nodeName: info.nodeName }, userText, myRequestId);
+      return;
+    }
+    overlay.pushChat({ agent: targetAgent, from: 'system', text: `${targetAgent} is not reachable right now.` });
+    return;
+  }
+
   // Clears a running presentation -- applies to EVERY genuinely new user input, regardless of the
   // target. Actually interrupting the target's own in-flight work no longer happens here (that
   // would otherwise also abort an unrelated, independently working Oscar target, just because
@@ -952,15 +1271,28 @@ function askAgent(userText) {
 }
 
 // -- Start the agent network (only if net-config.json designates this machine as the hub) ---
-const NET_CONFIG_FILE = process.env.AGENT_NET_CONFIG || path.join(__dirname, 'net-config.json');
-if (fs.existsSync(NET_CONFIG_FILE)) {
+// netConfig/NET_CONFIG_FILE/NET_PORT are loaded near the top of this file now (provisioning needs
+// them at module load) -- this block only decides whether to actually start listening.
+if (netConfig) {
   try {
-    const netConfig = JSON.parse(fs.readFileSync(NET_CONFIG_FILE, 'utf8'));
     if (netConfig.role === 'hub') {
+      // Lets nodes find this machine again after the network changed, without anyone editing an
+      // IP address by hand (see discovery.js). The fingerprint travels along so a node can tell
+      // this hub apart from any other beacon on the network.
+      try {
+        startHubBeacon({
+          hubName: netConfig.self,
+          port: NET_PORT,
+          fingerprint: fingerprintOfCertPem(loadPeerCert(netConfig.self))
+        });
+      } catch (e) {
+        console.error('[discovery] beacon could not start:', e.message);
+      }
+
       hub = startHub({
         selfName: netConfig.self,
         peers: netConfig.peers || [],
-        port: netConfig.port || 8788,
+        port: NET_PORT,
         onPeerDown: (nodeName) => {
           for (const [agentName, info] of remoteAgents) if (info.nodeName === nodeName) remoteAgents.delete(agentName);
           if (mainDisplayTarget && mainDisplayTarget.nodeName === nodeName) {
@@ -1018,7 +1350,9 @@ if (fs.existsSync(NET_CONFIG_FILE)) {
           // node-agent.js/sayWithPresentation). requestId belongs to the original question that
           // dispatched this agent in the first place -- same staleness check as answer/speech-done
           // above, no new counter.
-          if (msg.type === 'present-request' && typeof msg.url === 'string' && typeof msg.audioBase64 === 'string') {
+          if (msg.type === 'present-request' && typeof msg.url === 'string') {
+            const wireSegments = normalizePresentSegments(msg);
+            if (!wireSegments) return; // no usable audio -- not a presentation this hub can relay
             if (msg.requestId !== activeRequestByTarget.get(msg.agentName)) return; // stale, ignore
             if (!mainDisplayTarget || !isReachable(mainDisplayTarget.agentName)) {
               console.log(`[maindisplay] "${msg.agentName}" wanted to present, but no main display is assigned or reachable.`);
@@ -1029,23 +1363,24 @@ if (fs.existsSync(NET_CONFIG_FILE)) {
             const text = typeof msg.text === 'string' ? msg.text : '';
             if (mainDisplayTarget.nodeName === null) {
               // The hub is itself the main display -- no network hop needed, play locally right away.
-              const filePath = path.join(__dirname, 'audio_out', `present-${Date.now()}.wav`);
-              try {
-                fs.writeFileSync(filePath, Buffer.from(msg.audioBase64, 'base64'));
-              } catch (e) {
-                console.error('[maindisplay] Could not write audio data:', e.message);
-                cleanupFollowUp(msg.requestId);
-                return;
-              }
-              playPresentationLocally(filePath, msg.agentName, msg.url, text, msg.requestId, suggestedNext, msg.faceStyle);
+              const segments = writeSegmentFiles(wireSegments);
+              if (!segments) { cleanupFollowUp(msg.requestId); return; }
+              playPresentationLocally(segments, msg.agentName, msg.url, text, msg.requestId, suggestedNext, msg.faceStyle);
             } else {
               const deliver = () => {
                 try {
                   pendingPresentationSuggested.set(msg.requestId, suggestedNext);
                   presentationOwnerRequestId = msg.requestId;
-                  currentPresentation = { agentName: msg.agentName, url: msg.url, faceStyle: msg.faceStyle };
-                  hub.send(mainDisplayTarget.nodeName, { type: 'present', requestId: msg.requestId, agentName: msg.agentName, url: msg.url, audioBase64: msg.audioBase64, text, faceStyle: msg.faceStyle });
-                  console.log(`[maindisplay] "${msg.agentName}" is presenting on "${mainDisplayTarget.agentName}": ${msg.url}`);
+                  currentPresentation = { agentName: msg.agentName, url: msg.url, faceStyle: msg.faceStyle, slide: 0 };
+                  // Relayed as normalized segments rather than passing msg straight through -- the
+                  // sending node may be an older build that only set audioBase64, and the display
+                  // node should get one consistent shape either way.
+                  hub.send(mainDisplayTarget.nodeName, {
+                    type: 'present', requestId: msg.requestId, agentName: msg.agentName, url: msg.url, text, faceStyle: msg.faceStyle,
+                    segments: wireSegments,
+                    audioBase64: wireSegments.length === 1 ? wireSegments[0].audioBase64 : undefined
+                  });
+                  console.log(`[maindisplay] "${msg.agentName}" is presenting on "${mainDisplayTarget.agentName}"${wireSegments.length > 1 ? ` (${wireSegments.length} slides)` : ''}: ${msg.url}`);
                 } catch (e) {
                   // e.g. MAX_MSG_BYTES exceeded (see agent-net.js) -- avoid crashing, cleanly abandon
                   // the operation instead of taking the whole process down with it.

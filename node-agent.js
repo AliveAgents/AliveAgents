@@ -13,10 +13,12 @@ const spawn = require('cross-spawn');
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
-const { connectToHub } = require('./agent-net.js');
+const { connectToHub, fingerprintOfCertPem, loadPeerCert } = require('./agent-net.js');
+const { listenForHub } = require('./discovery.js');
 const { createSpeaker } = require('./speech.js');
-const { startOverlayServer, getLanIp } = require('./overlay-server.js');
-const { extractFollowUpTag, buildTagHint, buildPeersLine, extractPresentationTag } = require('./followup-tag.js');
+const { startOverlayServer, getLanIp, contentUrlPrefix, localizeContentUrl } = require('./overlay-server.js');
+const { extractFollowUpTag, buildTagHint, buildPeersLine, extractPresentationTag, splitSlideSegments } = require('./followup-tag.js');
+const inboxLib = require('./inbox.js');
 
 // Spawn the real claude.exe directly instead of the bare 'claude' command whenever the bundled
 // portable install is present. On Windows, 'claude' resolves to claude.cmd, and spawning a .cmd
@@ -38,7 +40,16 @@ if (!fs.existsSync(CONFIG_FILE)) {
   console.error(`${CONFIG_FILE} is missing. Rename net-config.example.json to net-config.json and adjust it.`);
   process.exit(1);
 }
-const config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+// readJsonFile instead of a bare JSON.parse: a UTF-8 byte order mark at the start of the file
+// makes JSON.parse throw, and the agent then dies at startup with a stack trace that says nothing
+// about the real cause. Windows produces such files easily -- Notepad, and PowerShell 5.1's
+// "Set-Content -Encoding UTF8", both write a BOM (2026-09-02: exactly that killed this agent).
+// The file is fine; only the invisible first character is not.
+function readJsonFile(file) {
+  return JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, ''));
+}
+
+const config = readJsonFile(CONFIG_FILE);
 
 const AGENT = {
   name: config.agentName || 'Node',
@@ -60,7 +71,8 @@ const OVERLAY_PORT = config.overlayPort || 8787;
 const overlay = startOverlayServer({ port: OVERLAY_PORT });
 // This agent's own reachable base URL for self-generated presentation content
 // (presented_content/, see the buildTagHint() calls below) -- computed once, never changes at runtime.
-const CONTENT_URL_PREFIX = `http://${getLanIp()}:${OVERLAY_PORT}`;
+// Includes the per-process content key -- see the matching line in agent-bridge-server.js.
+const CONTENT_URL_PREFIX = contentUrlPrefix(`http://${getLanIp()}:${OVERLAY_PORT}`);
 
 // Presentation currently running on THIS screen (if this node is currently the main display) --
 // { agentName, url } | null. A thin wrapper around overlay.setState is needed because that
@@ -82,7 +94,7 @@ setOverlayState({ status: 'idle', text: '', agent: AGENT.name });
 const SESSION_FILE = path.join(__dirname, `.session-${config.self}.json`);
 
 function loadSessionId() {
-  try { return JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8')).sessionId || null; }
+  try { return readJsonFile(SESSION_FILE).sessionId || null; }
   catch (e) { return null; }
 }
 function saveSessionId(id) {
@@ -108,6 +120,46 @@ let peersDirty = true;
 // hint at all, and whether a reply with a presentation marker is even attempted
 // (sayWithPresentation) instead of speaking normally right away.
 let knownMainDisplay = null;
+
+// Optional per agent in net-config.json: "workDir": "D:/Projects/Website" -- the folder this
+// agent's Claude session actually runs in, so it can work on a real project instead of on the
+// AliveAgents checkout.
+//
+// This is worth understanding before changing it, because three things hang off the working
+// directory (all verified live, 2026-08-25):
+//   * The project's own CLAUDE.md is read automatically. That is the point: it is how an agent
+//     "knows" a project without anyone wiring anything up.
+//   * Claude Code scopes its own memory per project path, so each workDir gets its own.
+//   * File access is CONFINED to the working directory. An absolute path in --allowedTools does
+//     NOT grant access outside it on its own -- the agent politely refuses. Only --add-dir opens
+//     a second root, which is why AliveAgents has to be added explicitly below, or presentations
+//     and the inbox would silently stop working.
+// Resumed sessions survive the switch, so changing this does not wipe an agent's memory.
+const WORK_DIR = (() => {
+  if (!config.workDir) return __dirname;
+  const resolved = path.resolve(config.workDir);
+  if (!fs.existsSync(resolved)) {
+    console.error(`[agent] workDir "${resolved}" does not exist -- staying in ${__dirname}`);
+    return __dirname;
+  }
+  return resolved;
+})();
+if (WORK_DIR !== __dirname) console.log(`[agent] working in ${WORK_DIR}`);
+
+// How the two agent-owned folders are NAMED to the model. Relative reads better and is what the
+// agent sees in its own working directory -- but only while that IS this folder. Everything the
+// agent is told about a path has to survive workDir, or it quietly writes to the wrong place.
+const asPromptPath = (sub) => (WORK_DIR === __dirname ? sub : path.join(__dirname, sub).replace(/\\/g, '/'));
+const CONTENT_DIR_FOR_PROMPT = asPromptPath('presented_content');
+const INBOX_DIR_FOR_PROMPT = asPromptPath('inbox');
+
+// Files that arrived since this agent's last reply, so they can be marked [NEW] exactly once.
+const newInboxFiles = new Set();
+const inboxReceiver = inboxLib.createReceiver({
+  root: __dirname,
+  log: console.log,
+  onComplete: (name) => { newInboxFiles.add(name); }
+});
 
 let requestId = 0;
 let currentClaudeChild = null;
@@ -136,7 +188,7 @@ function interruptCurrent() {
   if (currentClaudeChild) { try { currentClaudeChild.kill(); } catch (e) {} currentClaudeChild = null; }
   // Discards a still-open speak-request/display-go wait for a now-superseded previous task --
   // otherwise a late-arriving display-go could play stale, outdated audio.
-  for (const pending of pendingDisplayGo.values()) { if (pending.filePath) fs.unlink(pending.filePath, () => {}); }
+  for (const pending of pendingDisplayGo.values()) { for (const s of pending.segments || []) fs.unlink(s.filePath, () => {}); }
   pendingDisplayGo.clear();
 }
 
@@ -148,7 +200,7 @@ function interruptCurrent() {
 // its speech doesn't talk over the running presentation.
 function stopPlaybackOnly() {
   speaker.stopSpeaking();
-  for (const pending of pendingDisplayGo.values()) { if (pending.filePath) fs.unlink(pending.filePath, () => {}); }
+  for (const pending of pendingDisplayGo.values()) { for (const s of pending.segments || []) fs.unlink(s.filePath, () => {}); }
   pendingDisplayGo.clear();
 }
 
@@ -170,16 +222,55 @@ function stopPlaybackOnly() {
 // have to ask the hub first whether its own screen is currently free (speak-request/display-go),
 // because this node itself cannot know whether, say, a foreign presentation is currently running
 // (that would arrive via a completely different message, 'present').
-function playAndReport(filePath, text, myRequestId, hubRequestId, suggestedNext = [], isMainDisplay = false) {
+// Reads the audio out of a 'present' message. Accepts BOTH the current shape (segments[]) and the
+// older single-blob audioBase64 -- deliberately, so a hub still running an outdated copy of the
+// project degrades to a working single-slide presentation instead of having its message silently
+// ignored by the guard. Mirrored in agent-bridge-server.js (parallel logic on both sides, kept
+// duplicated on purpose -- see CLAUDE.md).
+// Returns null if there is no usable audio at all.
+function normalizePresentSegments(msg) {
+  if (Array.isArray(msg.segments) && msg.segments.length) {
+    const usable = msg.segments.filter((s) => s && typeof s.audioBase64 === 'string');
+    if (usable.length) return usable.map((s) => ({ audioBase64: s.audioBase64, text: typeof s.text === 'string' ? s.text : '' }));
+  }
+  if (typeof msg.audioBase64 === 'string') {
+    return [{ audioBase64: msg.audioBase64, text: typeof msg.text === 'string' ? msg.text : '' }];
+  }
+  return null;
+}
+
+// Writes each segment's audio to its own file under audio_out/. Returns null (having cleaned up
+// whatever was already written) if any of them fails, so callers get an all-or-nothing result.
+function writeSegmentFiles(wireSegments) {
+  const written = [];
+  try {
+    wireSegments.forEach((s, i) => {
+      const filePath = path.join(__dirname, 'audio_out', `present-${Date.now()}-${i}.wav`);
+      fs.writeFileSync(filePath, Buffer.from(s.audioBase64, 'base64'));
+      written.push({ filePath, text: s.text });
+    });
+    return written;
+  } catch (e) {
+    console.error('[maindisplay] Could not write audio data:', e.message);
+    for (const s of written) fs.unlink(s.filePath, () => {});
+    return null;
+  }
+}
+
+// segments: [{ filePath, text }] | null -- one entry per slide for a presentation that fell back
+// to plain speech, and simply a single entry for an ordinary reply. Taking an array even here
+// means a failed presentation can still be spoken in full (with its slide pauses intact) instead
+// of having to throw away everything but the first segment.
+function playAndReport(segments, text, myRequestId, hubRequestId, suggestedNext = [], isMainDisplay = false) {
   // "answer" goes out immediately (the text is final) -- purely informational, Oscar doesn't read it aloud.
   if (hubRequestId !== undefined) {
     link.send({ type: 'answer', requestId: hubRequestId, agentName: AGENT.name, text, suggestedNext });
   }
-  if (filePath) {
+  if (segments && segments.length) {
     const playNow = () => {
-      setOverlayState({ status: 'speaking', text, agent: AGENT.name });
-      speaker.playLocally(filePath, () => {
-        fs.unlink(filePath, () => {});
+      speaker.playSequence(segments.map((s) => s.filePath), (index) => {
+        setOverlayState({ status: 'speaking', text: segments[index].text, agent: AGENT.name });
+      }, () => {
         if (myRequestId === requestId) setOverlayState({ status: 'idle', text: '', agent: AGENT.name });
         // "speech-done" only goes out ONCE actually done speaking (not already once the text is
         // final) -- Oscar needs this to only send the next agent in a follow-up chain AFTER
@@ -190,7 +281,7 @@ function playAndReport(filePath, text, myRequestId, hubRequestId, suggestedNext 
       });
     };
     if (isMainDisplay && hubRequestId !== undefined) {
-      pendingDisplayGo.set(hubRequestId, { filePath, resume: playNow });
+      pendingDisplayGo.set(hubRequestId, { segments, resume: playNow });
       link.send({ type: 'speak-request', requestId: hubRequestId, agentName: AGENT.name, faceStyle: config.faceStyle || '' });
     } else {
       playNow();
@@ -206,7 +297,7 @@ function playAndReport(filePath, text, myRequestId, hubRequestId, suggestedNext 
 function say(text, myRequestId, hubRequestId, suggestedNext = [], isMainDisplay = false) {
   speaker.synthesizeSpeech(text, (filePath) => {
     if (myRequestId !== requestId) { if (filePath) fs.unlink(filePath, () => {}); return; }
-    playAndReport(filePath, text, myRequestId, hubRequestId, suggestedNext, isMainDisplay);
+    playAndReport(filePath ? [{ filePath, text }] : null, text, myRequestId, hubRequestId, suggestedNext, isMainDisplay);
   });
 }
 
@@ -216,36 +307,48 @@ function say(text, myRequestId, hubRequestId, suggestedNext = [], isMainDisplay 
 // is running on the other screen after all. Falls back to normal speech on any error (no Piper,
 // send failure, e.g. because MAX_MSG_BYTES was exceeded) via playAndReport, without wasting the
 // already-finished audio file, instead of letting the reply silently vanish.
-function sayWithPresentation(text, myRequestId, hubRequestId, url, suggestedNext, isMainDisplay) {
+// slideTexts: one spoken segment per slide (see splitSlideSegments) -- a single-slide
+// presentation is the one-element case, no separate path.
+function sayWithPresentation(slideTexts, myRequestId, hubRequestId, url, suggestedNext, isMainDisplay) {
   if (/localhost|127\.0\.0\.1/i.test(url)) {
     console.log(`[maindisplay] Warning: "${url}" looks like a local address -- might not be reachable from the main-display machine.`);
   }
-  speaker.synthesizeSpeech(text, (filePath) => {
-    if (myRequestId !== requestId) { if (filePath) fs.unlink(filePath, () => {}); return; }
-    if (!filePath) {
+  const text = slideTexts.join(' ');
+  speaker.synthesizeAll(slideTexts, (filePaths) => {
+    if (myRequestId !== requestId) { if (filePaths) for (const f of filePaths) fs.unlink(f, () => {}); return; }
+    if (!filePaths) {
       // No Piper -- no reliable "done" point for a presentation, speak normally.
-      playAndReport(filePath, text, myRequestId, hubRequestId, suggestedNext, isMainDisplay);
+      playAndReport(null, text, myRequestId, hubRequestId, suggestedNext, isMainDisplay);
       return;
     }
-    let audioBase64;
+    const segments = filePaths.map((filePath, i) => ({ filePath, text: slideTexts[i] }));
+    let wireSegments;
     try {
-      audioBase64 = fs.readFileSync(filePath).toString('base64');
+      wireSegments = segments.map((s) => ({ audioBase64: fs.readFileSync(s.filePath).toString('base64'), text: s.text }));
     } catch (e) {
       console.error('[maindisplay] Audio file unreadable, speaking normally instead:', e.message);
-      playAndReport(filePath, text, myRequestId, hubRequestId, suggestedNext, isMainDisplay);
+      playAndReport(segments, text, myRequestId, hubRequestId, suggestedNext, isMainDisplay);
       return;
     }
     try {
-      const sent = link.send({ type: 'present-request', requestId: hubRequestId, agentName: AGENT.name, url, audioBase64, text, suggestedNext, faceStyle: config.faceStyle || '' });
+      // audioBase64 only for the single-slide case -- see the same spot in agent-bridge-server.js
+      // (costs nothing there, keeps an older hub working, and would only bloat a multi-slide deck).
+      const sent = link.send({
+        type: 'present-request', requestId: hubRequestId, agentName: AGENT.name, url, text, suggestedNext, faceStyle: config.faceStyle || '',
+        segments: wireSegments,
+        audioBase64: wireSegments.length === 1 ? wireSegments[0].audioBase64 : undefined
+      });
       if (!sent) throw new Error('not connected to the hub');
-      fs.unlink(filePath, () => {});
+      for (const s of segments) fs.unlink(s.filePath, () => {});
       // ownDisplayHidden: hide own overlay completely (not just idle) while the reply is running
       // on the FOREIGN main-display screen -- otherwise an idle face would sit here while the
       // actual reply is seen/heard elsewhere.
       setOverlayState({ status: 'idle', text: '', agent: AGENT.name, ownDisplayHidden: true });
     } catch (e) {
+      // e.g. MAX_MSG_BYTES exceeded, which a long multi-slide deck can genuinely hit -- the whole
+      // reply is still spoken locally rather than vanishing, just without the deck.
       console.error('[maindisplay] Could not send presentation, speaking normally instead:', e.message);
-      playAndReport(filePath, text, myRequestId, hubRequestId, suggestedNext, isMainDisplay);
+      playAndReport(segments, text, myRequestId, hubRequestId, suggestedNext, isMainDisplay);
     }
   });
 }
@@ -259,13 +362,22 @@ function runTask(userText, myRequestId, hubRequestId, isMainDisplay = false) {
   const peersLine = peersDirty ? buildPeersLine(knownPeers) : '';
   peersDirty = false;
   const hasMainDisplay = knownMainDisplay !== null;
-  const tagHint = buildTagHint(hasMainDisplay, CONTENT_URL_PREFIX);
+  // The folder is named absolutely once the agent works elsewhere -- otherwise it would helpfully
+  // create presented_content/ inside the project and write decks there, which the overlay server
+  // (serving from THIS folder) would never find.
+  const tagHint = buildTagHint(hasMainDisplay, CONTENT_URL_PREFIX, CONTENT_DIR_FOR_PROMPT);
+
+  // Rebuilt from the folder every turn (see the same spot in agent-bridge-server.js): files this
+  // agent moved or deleted last turn stop being mentioned by themselves.
+  const inboxFiles = inboxLib.listInbox(__dirname);
+  const inboxLine = inboxLib.buildInboxLine(inboxFiles, newInboxFiles, INBOX_DIR_FOR_PROMPT);
+  newInboxFiles.clear();
 
   const args = ['-p'];
   if (sessionId) {
-    args.push(`${userText} ${peersLine}`.replace(/\s+/g, ' ').trim(), '--resume', sessionId);
+    args.push(`${userText} ${peersLine} ${inboxLine}`.replace(/\s+/g, ' ').trim(), '--resume', sessionId);
   } else {
-    const persona = `You are ${AGENT.name}, part of a network of AI assistants coordinated by Oscar. ${peersLine} ${AGENT.personality} Message: ${userText}`
+    const persona = `You are ${AGENT.name}, part of a network of AI assistants coordinated by Oscar. ${peersLine} ${AGENT.personality} ${inboxLine} Message: ${userText}`
       .replace(/\s+/g, ' ').trim();
     args.push(persona);
   }
@@ -292,7 +404,18 @@ function runTask(userText, myRequestId, hubRequestId, isMainDisplay = false) {
   // EXACTLY its own presented_content/ folder, via Edit(...) (the CLI does accept Write(...) path
   // rules, but never actually enforces them -- empirically confirmed). ALWAYS appended, in
   // addition to config.allowedTools, not instead of it.
-  const allowedTools = config.allowedTools ? `${config.allowedTools},Edit(presented_content/**)` : 'Edit(presented_content/**)';
+  // "Skill" is in the same always-appended group -- see the matching spot in
+  // agent-bridge-server.js: without it the project's own skills (.claude/skills/, e.g. the
+  // multi-slide "presentation" one) are discovered but cannot be invoked once --allowedTools
+  // narrows the set.
+  // Edit(inbox/**) so this agent can act on files it was handed, not merely read them -- see the
+  // matching spot in agent-bridge-server.js.
+  // Relative while the agent runs in the AliveAgents folder; absolute once it works elsewhere,
+  // because these two folders always live HERE, not in the project. Paired with the --add-dir
+  // below -- an absolute rule without it grants nothing.
+  const own = (sub) => (WORK_DIR === __dirname ? `${sub}/**` : `${path.join(__dirname, sub).replace(/\\/g, '/')}/**`);
+  const baseTools = `Edit(${own('presented_content')}),Edit(${own('inbox')}),Skill`;
+  const allowedTools = config.allowedTools ? `${config.allowedTools},${baseTools}` : baseTools;
   args.push('--allowedTools', allowedTools);
   // Optional per agent in net-config.json: "permissionMode": one of the levels the CLI itself
   // supports -- "manual" (every change asks for confirmation, CLI default), "acceptEdits"
@@ -315,7 +438,15 @@ function runTask(userText, myRequestId, hubRequestId, isMainDisplay = false) {
   // agent-bridge-server.js) -- a single tool addition, not a blanket grant. The concrete
   // connector (which service, which credentials) has to be set up separately as its own MCP
   // server config, this here is just the socket for it.
-  if (config.mcpConfig) args.push('--mcp-config', config.mcpConfig);
+  // Resolved against THIS folder, not the working directory: an mcpConfig like
+  // "cloudflare-mcp.local.json" lives next to net-config.json, and once workDir points at a real
+  // project the CLI would otherwise look for it there and fail with "config file not found"
+  // (reported live 2026-08-25). An inline JSON string is passed through untouched.
+  if (config.mcpConfig) {
+    const raw = String(config.mcpConfig).trim();
+    const resolved = raw.startsWith('{') || path.isAbsolute(raw) ? raw : path.join(__dirname, raw);
+    args.push('--mcp-config', resolved);
+  }
   // Optional per agent in net-config.json: "chrome": true -- enables the Claude-in-Chrome
   // integration (mcp__claude-in-chrome__* tools). ADDITIONALLY needs a real, running Chrome with
   // the Claude-in-Chrome extension AND a one-time manual approval directly in the extension
@@ -325,7 +456,12 @@ function runTask(userText, myRequestId, hubRequestId, isMainDisplay = false) {
   // dangerously-skip-permissions, it has to be confirmed by hand once on the respective machine.
   if (config.chrome) args.push('--chrome');
 
-  const child = spawn(CLAUDE_EXE, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  // Opens the AliveAgents folder as a second root when the agent works elsewhere, so
+  // presented_content/ and inbox/ stay reachable. Omitted when they are the same folder -- adding
+  // the working directory to itself is noise.
+  if (WORK_DIR !== __dirname) args.push('--add-dir', __dirname);
+
+  const child = spawn(CLAUDE_EXE, args, { stdio: ['ignore', 'pipe', 'pipe'], cwd: WORK_DIR });
   currentClaudeChild = child;
 
   let out = '';
@@ -365,22 +501,33 @@ function runTask(userText, myRequestId, hubRequestId, isMainDisplay = false) {
     }
     // The presentation marker is extracted FIRST (it's the outermost one, see followup-tag.js),
     // FORWARD only afterward on the rest -- so both can be combined in a single reply.
-    const { cleanText: afterPresentation, presentationUrl } = extractPresentationTag(text);
+    const { cleanText: afterPresentation, presentationUrl: rawPresentationUrl } = extractPresentationTag(text);
+    // See the same spot in agent-bridge-server.js: a URL for one of our own files is rebuilt from
+    // the current base, because the model reproduces older base URLs out of its session history.
+    const presentationUrl = rawPresentationUrl ? localizeContentUrl(rawPresentationUrl, `http://${getLanIp()}:${OVERLAY_PORT}`) : rawPresentationUrl;
+    if (rawPresentationUrl && presentationUrl !== rawPresentationUrl) {
+      console.log(`[maindisplay] corrected a stale content URL: ${rawPresentationUrl}`);
+    }
     const { cleanText, suggested } = extractFollowUpTag(afterPresentation);
+    // Split unconditionally, not only when actually presenting: a [SLIDE] marker that survived
+    // into the TTS would be read out loud ("bracket slide"). Rejoining the segments is what the
+    // non-presenting paths below speak, so a stray marker simply disappears.
+    const slideSegments = splitSlideSegments(cleanText);
+    const spokenText = slideSegments.join(' ');
     // Shows HERE (before any hub-side check) whether there was a marker in the raw text at all --
     // without this there is no way to tell from the outside between "no marker attempted" and
     // "marker attempted, but discarded by the hub" (the logged spoken text is ALWAYS already
     // cleaned). Important for debugging marker reliability.
     console.log(`[${AGENT.name}] Marker in raw text: ${suggested.length ? suggested.join(', ') : '(none)'}`);
-    console.log(`[${AGENT.name}] Presentation marker: ${presentationUrl || '(none)'}`);
+    console.log(`[${AGENT.name}] Presentation marker: ${presentationUrl || '(none)'}${slideSegments.length > 1 ? `, ${slideSegments.length} slides` : ''}`);
     if (presentationUrl && knownMainDisplay) {
-      sayWithPresentation(cleanText, myRequestId, hubRequestId, presentationUrl, suggested, isMainDisplay);
+      sayWithPresentation(slideSegments, myRequestId, hubRequestId, presentationUrl, suggested, isMainDisplay);
       return;
     }
     if (presentationUrl && !knownMainDisplay) {
       console.log('[maindisplay] Presentation requested, but no main display known -- speaking normally.');
     }
-    say(cleanText, myRequestId, hubRequestId, suggested, isMainDisplay);
+    say(spokenText, myRequestId, hubRequestId, suggested, isMainDisplay);
   });
 }
 
@@ -404,15 +551,36 @@ const link = connectToHub({
       try { fs.unlinkSync(SESSION_FILE); } catch (e) {}
       peersDirty = true; // a fresh session should definitely get the peer list again
       currentPresentation = null;
-      for (const pending of pendingDisplayGo.values()) { if (pending.filePath) fs.unlink(pending.filePath, () => {}); }
+      for (const pending of pendingDisplayGo.values()) { for (const s of pending.segments || []) fs.unlink(s.filePath, () => {}); }
       pendingDisplayGo.clear();
       console.log(`[${AGENT.name}] Conversation reset.`);
     }
     // Comes from the hub ONLY on a genuinely new user input (see clearDisplay() in
     // agent-bridge-server.js) -- a plain follow-up forward no longer triggers this (that was the
     // original bug: the presentation vanished on the mere dispatch alone).
+    // Files a human dropped onto this agent on the hub machine, arriving chunked over the mTLS
+    // link (see inbox.js). Nothing is announced to the model here -- the next turn simply lists
+    // what is in inbox/, which keeps a delivery mid-conversation from interrupting anything.
+    if (msg.type === 'file-begin') { inboxReceiver.begin(msg); }
+    if (msg.type === 'file-chunk') { inboxReceiver.chunk(msg); }
+    if (msg.type === 'file-end') { inboxReceiver.end(msg); }
     if (msg.type === 'clear-presentation') {
       currentPresentation = null;
+      // The push is REQUIRED, and the history here is worth knowing before touching it again.
+      // The hub sends this on a genuinely new user input, which is exactly when the deck should
+      // come off the screen. Clearing the variable alone never reaches the browser: overlay state
+      // only travels via setOverlayState. On a machine that is purely a DISPLAY -- it gets no task
+      // of its own, so nothing else pushes a state -- the old deck then stayed up indefinitely.
+      //
+      // It LOOKED correct for a while only by accident: a since-fixed bug rebuilt a bogus
+      // presentation object with no url while the previous audio finished, and the overlay reads
+      // "no url" as "nothing presented" and tore the iframe down. Fixing that bug removed the
+      // accidental clearing and exposed this missing push (reported 2026-08-25: "jetzt geht die
+      // Präsentation nicht mehr weg beim nächsten Befehl").
+      // Status/text/agent are carried over unchanged, so this drops the presentation and nothing
+      // else -- the face keeps whatever it was doing.
+      const prev = overlay.getState();
+      setOverlayState({ status: prev.status, text: prev.text, agent: prev.agent });
     }
     // Reply to a question posed via speak-request (see playAndReport): the screen is now free,
     // actually play. updatePresentationSpeaker updates the small corner display to this agent, if
@@ -440,29 +608,41 @@ const link = connectToHub({
     // live via testing -- see the presentationSeq comment above). The own task only needs the
     // screen/speaker once IT is done, and by then it correctly gets queued behind this
     // presentation via speak-request/display-go anyway.
-    if (msg.type === 'present' && typeof msg.url === 'string' && typeof msg.audioBase64 === 'string') {
+    if (msg.type === 'present' && typeof msg.url === 'string') {
+      const wireSegments = normalizePresentSegments(msg);
+      if (!wireSegments) return; // no usable audio -- not a presentation this node can show
       const myPresentationSeq = ++presentationSeq;
       stopPlaybackOnly();
-      console.log(`[${AGENT.name}] showing presentation from "${msg.agentName}": ${msg.url}`);
-      const filePath = path.join(__dirname, 'audio_out', `present-${Date.now()}.wav`);
-      try {
-        fs.writeFileSync(filePath, Buffer.from(msg.audioBase64, 'base64'));
-      } catch (e) {
-        console.error('[maindisplay] Could not write audio data:', e.message);
-        return;
-      }
-      currentPresentation = { agentName: msg.agentName, url: msg.url, faceStyle: msg.faceStyle };
-      setOverlayState({ status: 'speaking', text: msg.text || '', agent: AGENT.name });
-      speaker.playLocally(filePath, () => {
-        fs.unlink(filePath, () => {});
+      console.log(`[${AGENT.name}] showing presentation from "${msg.agentName}"${wireSegments.length > 1 ? ` (${wireSegments.length} slides)` : ''}: ${msg.url}`);
+      const segments = writeSegmentFiles(wireSegments);
+      if (!segments) return;
+      currentPresentation = { agentName: msg.agentName, url: msg.url, faceStyle: msg.faceStyle, slide: 0 };
+      setOverlayState({ status: 'speaking', text: segments[0].text || msg.text || '', agent: AGENT.name });
+      speaker.playSequence(segments.map((s) => s.filePath), (index) => {
+        // Runs in the pause BEFORE each segment (see playSequence in speech.js) -- slide 0 is
+        // already on screen from the line above. Guarded by presentationSeq for the same reason
+        // the idle reset below is: a newer presentation arriving mid-deck must not have this one
+        // keep flipping slides underneath it.
+        // currentPresentation===null is the case that actually bit (observed live 2026-08-25): a
+        // new user input clears the display via 'clear-presentation', but THIS playback keeps
+        // running to the end of its audio. Object.assign({}, null, {slide}) then produced a
+        // presentation object carrying only a slide number -- no url, no agentName -- and the
+        // overlay reads "no url" as "nothing is being presented" and tears the iframe down
+        // mid-sentence. presentationSeq does not catch it: no NEW presentation started, the old
+        // one was merely cleared.
+        if (index === 0 || myPresentationSeq !== presentationSeq || !currentPresentation) return;
+        currentPresentation = Object.assign({}, currentPresentation, { slide: index });
+        setOverlayState({ status: 'speaking', text: segments[index].text || msg.text || '', agent: AGENT.name });
+      }, () => {
         // currentPresentation is DELIBERATELY left in place here (user's wish: the presentation
         // should stay up until a genuinely new user input arrives) -- only the own
         // 'clear-presentation' branch above still cleans that up, no longer interruptCurrent().
         // Only status/text jump back to idle, so the face doesn't "speak" forever while no more
         // sound is actually coming; setOverlayState() still keeps attaching currentPresentation
-        // regardless. Deliberately checked against presentationSeq (not requestId) -- an own task
-        // that happens to finish in the meantime should not trigger/block the idle reset here,
-        // that's a fully separate process (see the presentationSeq comment above).
+        // regardless. The deck also stays on its LAST slide, which is what makes clicking back
+        // through it by hand afterwards work. Deliberately checked against presentationSeq (not
+        // requestId) -- an own task that happens to finish in the meantime should not trigger/
+        // block the idle reset here, that's a fully separate process (see presentationSeq above).
         if (myPresentationSeq === presentationSeq) {
           setOverlayState({ status: 'idle', text: '', agent: AGENT.name });
         }
@@ -473,6 +653,35 @@ const link = connectToHub({
     }
   }
 });
+
+// Follows the hub when the network hands out different addresses -- a different flat, a hotspot,
+// a router change. Without this, hubHost in net-config.json is a literal address that quietly
+// stops existing and the agent dials into nothing forever (2026-08-31, exactly that).
+// A beacon is only acted on if it names THIS hub and carries the fingerprint of the certificate
+// this node already pinned; and even then the connection itself is still verified the usual way,
+// so the worst a forged beacon can do is cause a failed attempt.
+try {
+  listenForHub({
+    hubName: config.hubName,
+    expectedFp: fingerprintOfCertPem(loadPeerCert(config.hubName)),
+    currentHost: config.hubHost,
+    onFound: (address) => {
+      // Only while actually disconnected. A hub with several network adapters (Hyper-V, WSL, VPN)
+      // broadcasts from all of them, so beacons arrive from addresses that may not even be
+      // reachable from here -- observed live in testing, where the node hopped between a virtual
+      // and the real address, tearing down a perfectly good connection each time.
+      // Discovery is for finding a hub that is lost, not for second-guessing one that answers.
+      // An address that turns out to be unreachable simply fails to connect, which leaves the
+      // node open to the next beacon, so a wrong guess self-corrects.
+      if (link.isUp()) return;
+      if (link.setHost(address)) {
+        console.log(`[discovery] reconnecting to ${config.hubName} at ${address}`);
+      }
+    }
+  });
+} catch (e) {
+  console.error('[discovery] could not start listening:', e.message);
+}
 
 // Terminal input here is optional, but handy for testing locally right on this machine, without
 // having to go through Oscar.

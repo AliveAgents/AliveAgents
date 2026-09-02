@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent</title>
+<style>
+  /* The page the browser overlay is meant to be opened on: deliberately black and empty, because
+     the face (injected by the Tampermonkey userscript) is what you are supposed to look at.
+     The only thing living here is the file drop rail below.
+
+     Placement is bottom-LEFT on purpose. The overlay occupies the rest: the face is centred while
+     idle and moves to top-left while presenting, and the microphone button sits bottom-right.
+     Bottom-left is the one corner nothing else claims.
+
+     The overlay sits above this page (z-index 2147483647) but is pointer-events:none with no
+     background, so this rail stays both visible and clickable underneath it. During a presentation
+     the overlay's iframe covers the whole viewport, which hides the rail -- correct, nobody drops
+     files mid-presentation. */
+  html, body { margin: 0; height: 100%; background: #000; }
+
+  #drop-rail {
+    position: fixed; left: 18px; bottom: 18px; z-index: 1000;
+    display: flex; flex-direction: column-reverse; gap: 8px;
+    font-family: "Segoe UI", -apple-system, Helvetica, Arial, sans-serif;
+    max-height: calc(100vh - 36px); overflow: hidden;
+  }
+  #drop-rail.hidden { display: none; }
+
+  .rail-title {
+    color: #6d7484; font-size: .72rem; letter-spacing: .09em; text-transform: uppercase;
+    padding-left: 2px; margin-bottom: 2px; transition: color .2s;
+  }
+  #drop-rail:hover .rail-title, #drop-rail.dragging .rail-title { color: #aab1c0; }
+
+  .agent {
+    width: 208px; background: rgba(23,26,33,.82); border: 1px solid #2b2e38;
+    border-radius: 9px; padding: .55rem .7rem; cursor: pointer;
+    transition: border-color .15s, background .15s, transform .15s;
+  }
+  .agent:hover { border-color: #7fd1e8; background: rgba(23,26,33,.96); }
+  .agent.over { border-color: #7fd1e8; background: rgba(127,209,232,.16); transform: scale(1.02); }
+  /* While a file is being dragged anywhere over the window every target lights up, so it is
+     obvious where it can go -- the alternative is a rail nobody notices until told about it. */
+  #drop-rail.dragging .agent { border-color: #4a5262; background: rgba(23,26,33,.96); }
+  .agent.off { opacity: .45; cursor: not-allowed; }
+  .agent.off:hover { border-color: #2b2e38; background: rgba(23,26,33,.82); }
+
+  .name { color: #e9ebf0; font-size: .88rem; font-weight: 600; display: flex; align-items: center; gap: .4rem; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: #6ee7a8; flex: none; }
+  .agent.off .dot { background: #6d7484; }
+  .hint { color: #6d7484; font-size: .73rem; margin-top: .15rem; }
+  .status { font-size: .73rem; margin-top: .2rem; min-height: 1.1em; }
+  .status.go { color: #7fd1e8; }
+  .status.ok { color: #6ee7a8; }
+  .status.bad { color: #ff8a5c; }
+
+  input[type=file] { display: none; }
+
+  /* -- Typing to an agent ---------------------------------------------------------------------
+     For links, exact wording, or simply being quiet. Opens above the rail, one at a time. */
+  .row { display: flex; align-items: center; gap: .4rem; margin-top: .35rem; }
+  .chat-btn {
+    border: 1px solid #2b2e38; background: rgba(23,26,33,.9); color: #99a0ae;
+    border-radius: 6px; font-size: .72rem; padding: .12rem .45rem; cursor: pointer;
+    font-family: inherit; transition: border-color .15s, color .15s;
+  }
+  .chat-btn:hover { border-color: #7fd1e8; color: #e9ebf0; }
+  .agent.off .chat-btn { opacity: .5; cursor: not-allowed; }
+
+  #chat {
+    position: fixed; left: 18px; bottom: 18px; z-index: 1001;
+    width: 380px; max-width: calc(100vw - 36px); height: min(460px, calc(100vh - 36px));
+    background: #12151b; border: 1px solid #2b2e38; border-radius: 11px;
+    display: none; flex-direction: column; overflow: hidden;
+    font-family: "Segoe UI", -apple-system, Helvetica, Arial, sans-serif;
+    box-shadow: 0 10px 40px rgba(0,0,0,.6);
+  }
+  #chat.open { display: flex; }
+  .chat-head {
+    display: flex; align-items: center; gap: .5rem; padding: .6rem .8rem;
+    border-bottom: 1px solid #2b2e38; color: #e9ebf0; font-size: .9rem; font-weight: 600;
+  }
+  .chat-head .close {
+    margin-left: auto; background: none; border: 0; color: #99a0ae; cursor: pointer;
+    font-size: 1.1rem; line-height: 1; padding: 0 .2rem; font-family: inherit;
+  }
+  .chat-head .close:hover { color: #e9ebf0; }
+  .chat-log { flex: 1; overflow-y: auto; padding: .7rem .8rem; display: flex; flex-direction: column; gap: .5rem; }
+  .msg { font-size: .85rem; line-height: 1.45; max-width: 88%; padding: .4rem .6rem; border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .msg.you { align-self: flex-end; background: #1d3a44; color: #d9f2fa; }
+  .msg.agent { align-self: flex-start; background: #1c2029; color: #e9ebf0; }
+  .msg.system { align-self: center; background: none; color: #ff8a5c; font-size: .78rem; }
+  .msg.pending { opacity: .55; font-style: italic; }
+  .chat-empty { color: #6d7484; font-size: .8rem; text-align: center; margin: auto; padding: 1rem; }
+  .chat-input { display: flex; gap: .5rem; padding: .6rem .8rem; border-top: 1px solid #2b2e38; }
+  .chat-input textarea {
+    flex: 1; resize: none; background: #0d1015; border: 1px solid #2b2e38; border-radius: 7px;
+    color: #e9ebf0; font: inherit; font-size: .85rem; padding: .4rem .55rem; height: 2.4rem; max-height: 7rem;
+  }
+  .chat-input textarea:focus { outline: none; border-color: #7fd1e8; }
+  .chat-input button {
+    background: #7fd1e8; color: #0b0c10; border: 0; border-radius: 7px; padding: 0 .9rem;
+    font: inherit; font-size: .85rem; font-weight: 600; cursor: pointer;
+  }
+  .chat-input button:disabled { opacity: .4; cursor: default; }
+</style>
+</head>
+<body>
+
+<div id="drop-rail" class="hidden"><div class="rail-title">Agents</div></div>
+
+<div id="chat">
+  <div class="chat-head"><span class="dot"></span><span id="chat-name"></span><button class="close" type="button" aria-label="Close">×</button></div>
+  <div class="chat-log" id="chat-log"></div>
+  <div class="chat-input">
+    <textarea id="chat-text" rows="1" placeholder="Type a message… (Enter sends)"></textarea>
+    <button id="chat-send" type="button">Send</button>
+  </div>
+</div>
+
+<script>
+(function () {
+  const rail = document.getElementById('drop-rail');
+  const cards = new Map(); // agent name -> element
+
+  function makeCard(agent) {
+    const el = document.createElement('div');
+    el.className = 'agent' + (agent.online ? '' : ' off');
+    el.innerHTML = '<div class="name"><span class="dot"></span><span class="n"></span></div>' +
+                   '<div class="hint"></div><div class="status"></div>' +
+                   '<div class="row"><button class="chat-btn" type="button">write…</button></div>' +
+                   '<input type="file" multiple>';
+    el.querySelector('.n').textContent = agent.name;
+    el.querySelector('.hint').textContent = agent.online ? 'drop files or click' : 'offline';
+    // Stops the click from also reaching the card, which would open the file picker.
+    el.querySelector('.chat-btn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (el.dataset.online) openChat(el.dataset.name);
+    });
+
+    const picker = el.querySelector('input');
+    const status = el.querySelector('.status');
+
+    async function send(files) {
+      if (!el.dataset.online) return;
+      let done = 0, failed = 0;
+      for (const f of files) {
+        status.className = 'status go';
+        status.textContent = files.length > 1 ? `sending ${done + failed + 1}/${files.length}…` : `sending ${f.name}…`;
+        try {
+          const r = await fetch('/upload?agent=' + encodeURIComponent(el.dataset.name) + '&name=' + encodeURIComponent(f.name), { method: 'POST', body: f });
+          const j = await r.json().catch(() => ({ ok: r.ok }));
+          if (r.ok && j.ok !== false) done++; else { failed++; status.dataset.err = j.error || 'failed'; }
+        } catch (e) { failed++; status.dataset.err = 'failed'; }
+      }
+      status.className = 'status ' + (failed ? 'bad' : 'ok');
+      status.textContent = failed ? (status.dataset.err || 'failed') : (done > 1 ? done + ' files delivered' : 'delivered');
+      setTimeout(() => { if (status.textContent) { status.textContent = ''; status.className = 'status'; } }, 6000);
+    }
+
+    ['dragenter', 'dragover'].forEach((ev) => el.addEventListener(ev, (e) => {
+      e.preventDefault(); if (el.dataset.online) el.classList.add('over');
+    }));
+    ['dragleave', 'drop'].forEach((ev) => el.addEventListener(ev, () => el.classList.remove('over')));
+    el.addEventListener('drop', (e) => { e.preventDefault(); send(e.dataTransfer.files); });
+    el.addEventListener('click', () => { if (el.dataset.online) picker.click(); });
+    picker.addEventListener('change', () => { send(picker.files); picker.value = ''; });
+
+    return el;
+  }
+
+  function apply(agents) {
+    if (!agents.length) { rail.classList.add('hidden'); return; }
+    rail.classList.remove('hidden');
+    for (const a of agents) {
+      let el = cards.get(a.name);
+      if (!el) { el = makeCard(a); cards.set(a.name, el); rail.appendChild(el); }
+      // Updated in place rather than redrawn, so a status message survives the refresh below.
+      el.dataset.name = a.name;
+      el.dataset.online = a.online ? '1' : '';
+      el.classList.toggle('off', !a.online);
+      el.querySelector('.hint').textContent = a.online ? 'drop files or click' : 'offline';
+    }
+    for (const [name, el] of cards) {
+      if (!agents.some((a) => a.name === name)) { el.remove(); cards.delete(name); }
+    }
+  }
+
+  async function load() {
+    try {
+      const r = await fetch('/agents');
+      if (!r.ok) throw new Error('no');
+      apply(await r.json());
+    } catch (e) {
+      // No /agents route means this is a node, not the hub -- nodes have nothing to hand out, so
+      // the rail simply never appears and the page stays the plain black stage it always was.
+      rail.classList.add('hidden');
+    }
+  }
+
+  // Light every target up as soon as a file is dragged anywhere over the window.
+  let dragDepth = 0;
+  window.addEventListener('dragenter', (e) => {
+    if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return;
+    dragDepth++; rail.classList.add('dragging');
+  });
+  window.addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; rail.classList.remove('dragging'); } });
+  window.addEventListener('drop', (e) => { dragDepth = 0; rail.classList.remove('dragging'); e.preventDefault(); });
+  window.addEventListener('dragover', (e) => e.preventDefault()); // stop the browser opening the file
+
+  // -- Typing to an agent ------------------------------------------------------------------
+  // A second websocket alongside the face overlay's own. It subscribes to the chat stream, which
+  // the server sends ONLY to subscribers -- the overlay must never receive these messages, since
+  // it parses everything it gets as face state.
+  const panel = document.getElementById('chat');
+  const logEl = document.getElementById('chat-log');
+  const nameEl = document.getElementById('chat-name');
+  const textEl = document.getElementById('chat-text');
+  const sendBtn = document.getElementById('chat-send');
+  const history = new Map(); // agent -> [{from, text}], so switching panels keeps each thread
+  let openAgent = null;
+  let socket = null;
+
+  function connect() {
+    socket = new WebSocket('ws://' + location.host);
+    socket.onopen = () => socket.send(JSON.stringify({ type: 'subscribe-chat' }));
+    socket.onmessage = (ev) => {
+      let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (!m || m.type !== 'chat' || !m.agent) return;
+      // "you" entries are echoed back by the server, but the panel already showed them optimistically.
+      if (m.from === 'you') { markSent(m.agent, m.text); return; }
+      add(m.agent, m.from, m.text);
+    };
+    socket.onclose = () => setTimeout(connect, 2000);
+    socket.onerror = () => {};
+  }
+
+  function add(agent, from, text) {
+    const thread = history.get(agent) || [];
+    thread.push({ from, text });
+    history.set(agent, thread);
+    if (openAgent === agent) render();
+  }
+
+  // The optimistic line stops being greyed out once the server confirms it took the message.
+  function markSent(agent, text) {
+    const thread = history.get(agent) || [];
+    for (let i = thread.length - 1; i >= 0; i--) {
+      if (thread[i].from === 'you' && thread[i].text === text && thread[i].pending) { thread[i].pending = false; break; }
+    }
+    if (openAgent === agent) render();
+  }
+
+  function render() {
+    const thread = history.get(openAgent) || [];
+    logEl.innerHTML = '';
+    if (!thread.length) {
+      const p = document.createElement('div');
+      p.className = 'chat-empty';
+      p.textContent = 'Nothing yet. Anything you type here goes straight to ' + openAgent + ' — no name needed.';
+      logEl.appendChild(p);
+      return;
+    }
+    for (const m of thread) {
+      const d = document.createElement('div');
+      d.className = 'msg ' + m.from + (m.pending ? ' pending' : '');
+      d.textContent = m.text;
+      logEl.appendChild(d);
+    }
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function openChat(agent) {
+    openAgent = agent;
+    nameEl.textContent = agent;
+    panel.classList.add('open');
+    render();
+    textEl.focus();
+  }
+
+  function closeChat() { panel.classList.remove('open'); openAgent = null; }
+
+  function send() {
+    const text = textEl.value.trim();
+    if (!text || !openAgent) return;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      add(openAgent, 'system', 'Not connected to the hub right now.');
+      return;
+    }
+    const thread = history.get(openAgent) || [];
+    thread.push({ from: 'you', text, pending: true });
+    history.set(openAgent, thread);
+    socket.send(JSON.stringify({ type: 'user-input', text, agent: openAgent }));
+    textEl.value = '';
+    textEl.style.height = '';
+    render();
+  }
+
+  sendBtn.addEventListener('click', send);
+  panel.querySelector('.close').addEventListener('click', closeChat);
+  textEl.addEventListener('keydown', (e) => {
+    // Enter sends, Shift+Enter is a newline -- the convention everyone already expects.
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+    if (e.key === 'Escape') closeChat();
+  });
+  textEl.addEventListener('input', () => {
+    textEl.style.height = 'auto';
+    textEl.style.height = Math.min(textEl.scrollHeight, 112) + 'px';
+  });
+
+  connect();
+  load();
+  setInterval(load, 5000);
+})();
+</script>
+</body>
+</html>

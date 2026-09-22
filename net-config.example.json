@@ -5,17 +5,22 @@
   "hubName": "thorsten",
   "hubHost": "192.168.178.90",
   "hubPort": 8788,
+  "_agentName": "agentName and domain only introduce this machine to a hub that has no record of it yet. The hub keeps every agent's real name and responsibility (\"agents\" in its own net-config.json, written when the agent is enrolled) and tells the node. Once that record exists, editing these two here changes nothing -- change them at the hub with /agent name and /agent domain.",
   "agentName": "Nova",
   "piperVoice": "en_US-ljspeech-high.onnx",
+  "_androidTts": "Only for a node running on a phone (Termux). Piper has no build that works there, so Android's own TTS speaks instead and piperVoice is ignored. Android offers one engine rather than a folder of voices, so pitch and rate are what make two phone agents sound different. e.g. { \"language\": \"en\", \"pitch\": 1.15, \"rate\": 1.0 }",
   "overlayPort": 8787,
   "_workDir": "Optional. The folder this agent's Claude session runs in -- point it at a real project and the agent works there, reading that project's CLAUDE.md automatically and keeping its own memory for it. Omit it and the agent works in the AliveAgents folder as before. e.g. \"D:/Projekte/Website\"",
   "domain": "Responsible for the website, Cloudflare, booking.com, and the git repository containing the website code.",
   "personality": "Direct and pragmatic, answering in 1-3 short, chat-style sentences. No preamble phrases like \"As an AI, I would say\".",
   "effort": "high",
+  "_permissions": "allowedTools, permissionMode, chrome and mcpConfig are only what this agent starts with. What it may actually do is set on this machine's own face page (the shield button) and confirmed there with Windows Hello or a fingerprint -- see permissions.js. Once that has happened, editing these here changes nothing; mcpConfig still names which MCP servers the \"Extra tools\" switch turns on.",
   "allowedTools": "WebSearch,WebFetch",
   "permissionMode": "bypassPermissions",
   "chrome": true,
   "mcpConfig": "cloudflare-mcp.local.json",
   "mainDisplay": false,
-  "faceStyle": "ava"
+  "faceStyle": "ava",
+  "_faceTint": "Optional. The three state colours this agent wears, overriding whatever its faceStyle brings. Plain #rrggbb only -- anything else is rejected outright rather than corrected, because this ends up inside a stylesheet in the overlay's privileged document. Normally you never write this by hand: the hub generates a colour nobody else on the network has when the agent is enrolled. e.g. { \"idle\": \"#8faea6\", \"thinking\": \"#f2a62c\", \"speaking\": \"#3cecc0\" }",
+  "faceTint": null
 }

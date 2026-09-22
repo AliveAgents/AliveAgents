@@ -17,11 +17,15 @@ audio_out/
 presented_content/
 # Files a human handed to this agent -- personal by definition, and the one folder here most
 # likely to contain photos or documents that must never end up in a public repository.
-inbox/
+/inbox/
 *.log
 *-log.txt
 restart-log.txt
 *.err
+
+# What an update replaced (kept for going back by hand) and its half-downloaded files -- see updater.js.
+.update-backup/
+.update-staging/
 
 # Superseded by the unified agent-face-overlay.user.js, kept locally for reference only.
 legacy/

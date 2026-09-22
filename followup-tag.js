@@ -91,89 +91,77 @@ function splitSlideSegments(text) {
 // Arrays must not appear in it: the regex stops at the first "]", so a nested array would truncate
 // the payload. Every field this accepts is a string or a boolean anyway.
 //
-// Deliberately NOT taught in buildTagHint below: provisioning is something the user explicitly
-// asks for, so the "new-agent" skill carries the instructions and is loaded only then. Putting it
-// in the standing hint would cost tokens on every single reply for a once-in-a-while operation --
-// the lesson from the [SLIDE] wording, which is in the hint precisely because it must hold on
-// every turn that shows a deck.
+// Taught only in the "new-agent" skill, which the hub alone has and loads when the user actually
+// asks for a new agent. A once-in-a-while operation has no business in text that travels with
+// every turn.
 const PROVISION_TAG_RE = /\s*\[PROVISION:\s*(\{[^\]]*\})\s*\]\s*[.!]?/i;
 
-function extractProvisionTag(text) {
+// A trusted agent asking for its own name or responsibility to change, e.g.
+// [IDENTITY: {"domain":"...","reason":"..."}]. Only ever a request: the node hands it to the hub, the
+// hub shows it to the user, and nothing changes unless the user accepts it on the hub's own page or
+// console (see receiveIdentityRequest in agent-bridge-server.js). Same JSON rules as PROVISION, and
+// the same tolerance for markdown around it as SLIDE -- whatever is left next to a marker is spoken.
+// Taught in the network skill.
+const IDENTITY_TAG_RE = /\s*[`*_]*\s*\[IDENTITY:\s*(\{[^\]]*\})\s*\][`*_]*\s*[.!]?/i;
+
+// Cuts one JSON marker out of a reply. Malformed JSON is reported as { _malformed } rather than
+// silently dropped: for PROVISION the caller tells the user out loud instead of leaving them waiting
+// for a code that never comes, for IDENTITY the agent hears that its request did not go through.
+function extractJsonMarker(text, re) {
   const source = String(text || '');
-  const match = PROVISION_TAG_RE.exec(source);
-  if (!match) return { cleanText: source, provision: null };
+  const match = re.exec(source);
+  if (!match) return { cleanText: source, payload: null };
   const before = source.slice(0, match.index);
   const after = source.slice(match.index + match[0].length);
   const cleanText = (before + ' ' + after).replace(/\s+/g, ' ').trim();
-  let provision = null;
+  let payload;
   try {
     const parsed = JSON.parse(match[1]);
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) provision = parsed;
+    payload = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : { _malformed: match[1] };
   } catch (e) {
-    // Malformed JSON is reported as a failed attempt rather than silently dropped: the caller
-    // tells the user out loud, instead of leaving them waiting for a code that never comes.
-    provision = { _malformed: match[1] };
+    payload = { _malformed: match[1] };
   }
-  return { cleanText, provision };
+  return { cleanText, payload };
 }
 
-// Explanation of the marker convention for the persona. Appended on EVERY call (not just the
-// first turn of a session) -- unlike personality/domain, which only need to be stated once, this
-// behavior has to be followed reliably on every single reply, otherwise either forwarding breaks
-// (marker missing where one would be needed) or speaking breaks (marker accidentally spoken
-// aloud). Deliberately ONE sentence with no line break -- see the rule elsewhere in this project:
-// an embedded \n in a single CLI argument gets truncated on Windows.
-// contentUrlPrefix: this agent's own reachable base URL (e.g. "http://192.168.178.90:8787"), for
-// the case where it generates its own page under presented_content/ -- never pass "localhost",
-// that would be unreachable from the main-display machine (an ENTIRELY DIFFERENT physical device)
-// (see getLanIp() in overlay-server.js).
+function extractProvisionTag(text) {
+  const { cleanText, payload } = extractJsonMarker(text, PROVISION_TAG_RE);
+  return { cleanText, provision: payload };
+}
+
+function extractIdentityTag(text) {
+  const { cleanText, payload } = extractJsonMarker(text, IDENTITY_TAG_RE);
+  return { cleanText, identityRequest: payload };
+}
+
+// The whole standing text an agent carries on every turn -- and deliberately almost nothing.
 //
-// Deliberately NO per-turn pattern match (isPresentationRequest/PRESENTATION_REQUEST_RE) anymore
-// that additionally mixes in an "especially important right now" signal (existed until
-// 2026-08-18) -- a user decision, after two live-found false triggers of the same underlying
-// problem: no regex can grammatically distinguish "show me that" (a request AT the agent) from,
-// say, "let me show you now what matters" (the USER describing what THEY are about to do) --
-// only genuine language understanding can do that. The capability itself is instead described as
-// a permanently available interface (see hasMainDisplay below), included JUST AS consistently on
-// every single turn as the FORWARD explanation -- so the risk that originally led to introducing
-// the regex (a behavioral instruction stated only ONCE gets lost on the model) does not apply to
-// this wording, since it is never said only once anyway. Whether and when it gets used is now
-// entirely up to the agent itself, with no special-casing for individual turns.
-// contentDir: how the presentation folder is named to the model. Defaults to the relative
-// "presented_content", which is correct while the agent runs in this project's own folder. An
-// agent with a workDir pointing at a real project would resolve that against the project and
-// write decks somewhere the overlay server never serves, so the caller passes an absolute path.
-function buildTagHint(hasMainDisplay = false, contentUrlPrefix = null, contentDir = 'presented_content') {
-  let hint = 'Answer briefly as usual. If someone else on the network should additionally react to or follow up on your answer, append, right at the END (not as a spoken sentence of its own), exactly once: [FORWARD: Name] -- comma-separated for multiple names, ONLY real names from the network. If the user says something like "to everyone" or "to the whole network," list out ALL the names you know on the network individually there, not just the word "everyone." If there is nothing to add or no one fits, leave it off entirely -- that is the normal case.';
-  if (hasMainDisplay) {
-    hint += ' You also have a standing interface available to show the user something visually instead of just reading it aloud -- an analysis, a dashboard, search results, a presentation as a web page, or whatever else fits. To do this, append at the very END of your answer (after any FORWARD marker) exactly: [PRESENTATION: <URL>] -- that shows the page on the main display while you talk about it. Whether and when it is worth it is entirely your own call, every single turn, on your own initiative, not only when asked -- no one will tell you when it fits. Once you use it, the usual terseness (1-3 sentences) does NOT apply -- feel free to present the results at proper length then, that is not a problem, since the content is running visually alongside anyway.';
-    if (contentUrlPrefix) {
-      hint += ` If you do not have a ready page for it yet, generate a small, self-contained HTML page with the content yourself at ${contentDir}/<filename>.html (your write access covers exactly that, nowhere else) and reference it in the marker as ${contentUrlPrefix}/<filename>.html -- use that base exactly as given, it carries an access key without which the page cannot be fetched. If you already created a suitable page on the same topic earlier in this conversation, do NOT create a new file -- just reference the same URL again instead.`;
-      // Only the trigger and the marker syntax live here (the standing hint every turn carries);
-      // the actual deck markup belongs in the "presentation" skill, which the agent pulls in on
-      // its own when it decides several slides are warranted. Keeping the HTML out of here is
-      // deliberate: this text is prepended to EVERY single reply, so it has to stay short.
-      // Kept deliberately SHORT, and only about building a deck. Three progressively more forceful
-      // rewrites were tried live (2026-08-25) to also cover "show me that presentation again",
-      // where the agent re-sends the URL with a single unsplit sentence and the deck therefore
-      // sits on slide one. All three failed identically -- the model treats a re-show as a trivial
-      // re-display no matter how the rule is phrased, including as a hard "syntax rule". Since
-      // this text is prepended to EVERY reply, a rule that does not work is a permanent token cost
-      // for nothing, so it was reverted to the wording that is actually verified to work for fresh
-      // presentations. A re-show still displays the deck correctly; it just does not re-narrate,
-      // and it stays clickable by hand. Deliberately accepted (user's call).
-      hint += ' For something that genuinely has several parts, you can build a multi-slide deck instead of a single page -- use your "presentation" skill for the markup, and split the spoken text with [SLIDE] where each slide ends, so the deck advances by itself in time with what you are saying. Only worth it when the content really is a sequence; a single page stays the better answer for one chart or one short answer.';
-    }
-  }
-  return hint;
+// Until 2026-09-14 this slot held the complete marker rules plus the list of online agents, about
+// 767 tokens paid on every turn whether or not the turn involved anyone else. The rules now live in
+// skills (agent-skills/), which Claude Code loads only when the agent decides it needs one, and what
+// changes -- who is online, whether a display is connected -- lives in files those skills point to.
+// agent-skills/README.md has the reasoning and the history, including why the rules originally
+// moved out of the message (an imperative there was once flagged as a possible prompt injection).
+//
+// What stays is only what an agent cannot find out on its own: that there IS a network, and which
+// skills describe it. The last sentence carries the one lesson that cost real bugs -- a roster read
+// earlier in a conversation is a stale roster. The text is identical on every turn, so unlike the
+// roster it replaces, it never invalidates the prompt cache.
+//
+// One line, no embedded newline: Windows splits command-line arguments at real line breaks, which
+// once truncated a prompt and broke the JSON output.
+function buildSystemPointer({ agentName, canProvision = false }) {
+  const skills = [
+    '`network` (who is online right now, what each agent is responsible for, and how to pass something on to one of them or to everyone)',
+    '`presentation` (showing something on a screen while you talk)',
+    '`inbox` (files people give you)',
+    '`workspace` (your own folder for files you create)',
+    '`sources` (saying where something you looked up comes from)'
+  ];
+  if (canProvision) skills.push('`new-agent` (setting up a new agent on another machine)');
+  // The clause about addresses is here and not only in the skill: the web search tool's own instructions
+  // ask for a list of links at the end of every answer that used it, and the voice read them out.
+  return `You are ${agentName}, one of several AI agents on a small local network, each on its own machine with its own voice. Your replies are spoken aloud, so keep them to a few natural sentences unless you are presenting, and never put a web address, link or file path in them -- name the source instead. Everything that involves the rest of the network is described in your skills: ${skills.join(', ')}. Who is online changes while you run, so load \`network\` again whenever you are about to involve someone else, rather than relying on what you saw earlier.`;
 }
 
-// peers: Array of { name, domain }. Only meant for the FIRST turn of a session (the persona
-// line), so an agent even knows WHO else is on the network and what they do.
-function buildPeersLine(peers) {
-  if (!peers || peers.length === 0) return '';
-  const parts = peers.map((p) => (p.domain ? `${p.name} (${p.domain})` : p.name));
-  return `Also on the network: ${parts.join(', ')}.`;
-}
-
-module.exports = { extractFollowUpTag, buildTagHint, buildPeersLine, extractPresentationTag, splitSlideSegments, extractProvisionTag };
+module.exports = { extractFollowUpTag, buildSystemPointer, extractPresentationTag, splitSlideSegments, extractProvisionTag, extractIdentityTag };

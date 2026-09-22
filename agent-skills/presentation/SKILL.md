@@ -1,13 +1,58 @@
 ---
 name: presentation
-description: Build a multi-slide deck to show on the network's main display while you talk through it, with the slides advancing in time with your narration. Use when a spoken answer has several distinct parts worth showing as a sequence — a walkthrough, a comparison, a set of findings, a plan with stages. Not for a single chart, a single number, or a short answer, which stay a plain one-page presentation.
+description: Show something on screen while you talk (the network's main display, or your own screen when none is set) — a single page (a chart, a table, search results, a dashboard) or a multi-slide deck that advances in time with your narration. Use whenever a visual would say it better than speech alone; that call is yours to make on any turn, without being asked. Not for a short answer that needs no picture.
 ---
 
-# Multi-slide presentations
+# Showing things on screen
 
-You can already show a single page on the main display with `[PRESENTATION: <url>]`. This skill is
-for the case where the content genuinely has *parts*: a deck you talk through, where each slide
-appears exactly when you start talking about it.
+## First, look at the screen
+
+Read `{{SKILL_DIR}}/display.md`. It says which screen a presentation appears on right now — the
+network's main display, or your own screen when none is set — which folder to write pages into,
+and how to name a page in the marker.
+
+## Design for that screen
+
+`display.md` also says what kind of screen it is — phone, tablet or large — and roughly how long its
+short and long side are. It does not say which way up the screen is held: a phone gets turned, so a
+deck for a phone has to work both ways. Design for it:
+
+- **A phone:** one column. Stack what would sit side by side on a big screen. Short headings, at
+  most three bullets, fewer words overall — your narration carries the detail.
+- **A tablet:** one column for anything dense; two only for a picture beside a short caption.
+- **A large screen:** room for two columns, a chart beside its takeaway, more on a slide.
+- **Size unknown:** design so it also works on a phone.
+
+Whatever the screen, size things relatively — `%`, `vw`, `clamp()` — and never give a box a fixed
+pixel width or height. A deck gets clicked through again later, maybe somewhere else, and fixed
+sizes are what break it. A slide that still ends up too big is scaled down to fit rather than cut
+off; that is a safety net, not something to design for.
+
+## A single page
+
+Append this at the very end of your reply, after any FORWARD marker, exactly once:
+
+[PRESENTATION: <file name or website address>]
+
+The page appears on that screen while your reply is spoken. Whether a visual is worth it is
+your own call on every turn — nobody will ask for it. Once you present, the usual brevity does not
+apply: narrate at proper length, since the content runs alongside.
+
+If there is no ready page, write a small self-contained HTML file into the folder named in
+`display.md` and put just its file name in the marker, for example [PRESENTATION: tides.html].
+Built a page on the same topic earlier in this conversation? Name the same file again instead of
+writing a new one.
+
+Self-contained means exactly that: the file is carried to the screen on its own, so other files next
+to it in the folder never arrive. Pictures come from the web by their full address, or are embedded
+as `data:` URLs. The page cannot load anything else from your machine, cannot store anything in the
+browser, and cannot embed other websites that need a login or cookies — a video player stays black.
+To show a website or a video, present its own address instead of wrapping it in a page.
+
+## Several parts: a deck
+
+A deck is for content that genuinely has *parts*: slides you talk through, each one appearing
+exactly when you start talking about it.
 
 ## Decide first whether it's actually a deck
 
@@ -26,9 +71,9 @@ slide marker where each slide ends. Segment *i* of your speech is spoken while s
 screen, and the deck advances by itself in the pause between segments. The listener can also click
 or arrow-key through it afterwards — that comes for free, you don't have to build it.
 
-Write the marker as bare text in the middle of your reply — never in backticks, never bold, never
-on a line of its own. It is stripped out before anything is spoken, and any formatting you wrap
-around it is left behind to be read out loud.
+The slide marker is [SLIDE]. Write it as bare text in the middle of your reply — never in backticks,
+never bold, never on a line of its own. It is stripped out before anything is spoken, and any
+formatting you wrap around it is left behind to be read out loud.
 
 The number of markers has to match the deck: **N sections means N−1 markers.** Before you send the
 reply, literally count both — sections in the file, markers in the narration — and check the
@@ -55,14 +100,12 @@ first real slide. Four sections narrated as three is the one thing that must not
 
 ## Writing the deck
 
-Write the file to `presented_content/<name>.html` (your write access covers exactly that folder) and
-reference it with the base URL you were given, as `<base>/<name>.html`. Use that base exactly as
-given — it carries an access key, and a URL without it is refused.
+Write the file into the folder named in `display.md` and name it in the marker by its file name.
 
 Link the two files every machine on this network serves at `/deck.css` and `/deck.js`. They handle
 the paging mechanics — which slide is visible, the progress bar, keyboard, swipe, the arrows, and
 receiving the advance signal while you speak. Those are root-relative paths on purpose: they
-resolve against your own machine, which is where the deck is served from.
+resolve against whichever machine shows the deck, and every machine has them.
 
 Never reimplement the paging JavaScript — that is what makes the deck advance in time with your
 voice, and a hand-rolled version will not receive the signal.
@@ -115,7 +158,7 @@ Three sections, so the reply carries two markers. Written exactly like this, pla
 Here's where the Q3 pipeline stands ahead of Thursday. [SLIDE] It's up eighteen percent on Q2, with
 forty-one open deals and average deal size holding at twelve thousand. [SLIDE] The catch is the
 concentration — a hundred and eighty-six thousand of it closes in the single week of the fifteenth,
-so that week is the whole quarter. [PRESENTATION: <base>/q3-pipeline.html]
+so that week is the whole quarter. [PRESENTATION: q3-pipeline.html]
 ```
 
 ### Markup that works
@@ -172,8 +215,8 @@ high: this is displayed on someone else's screen, in a room you cannot see.
 
 ## The reply itself
 
-- Put `[PRESENTATION: <url>]` at the very end, exactly once, as always.
+- Put `[PRESENTATION: <file name>]` at the very end, exactly once, as always.
 - The usual terseness doesn't apply once you're presenting — narrate at proper length.
 - Narrate *around* the slide, don't read it out. The slide shows the numbers; you say what they mean.
-- Reusing a deck you already built earlier in this conversation? Reference the same URL again and
+- Reusing a deck you already built earlier in this conversation? Name the same file again and
   don't write a new file — but re-send the slide markers, since the narration is new each time.

@@ -67,11 +67,13 @@ npm install
 ```
 
 1. **Generate the hub's identity.** `sh make-certs.sh` on the hub machine. Additional machines don't need this — see below.
-2. **Configure the hub.** Copy `net-config.example.json` to `net-config.json` and set `role: "hub"` and `self`. The peer list fills itself in as agents join.
+2. **Configure the hub.** Copy `net-config.example.json` to `net-config.json` and set `role: "hub"` and `self`. The list of machines, and each agent's name and what it is responsible for, fill themselves in as agents join. Only the hub changes them later: `/agent name <machine> <Name>` or `/agent domain <machine> <text>` on its console or its chat page (there, Windows Hello asks first and names the change), and `/network` shows who is who. An agent can also ask for a change to its own entry: the request pops up on the hub's face page with Accept and Decline, and nothing changes until you click one and confirm the Windows Hello dialog that says what you accept.
 3. **Add a voice.** Drop a [Piper](https://github.com/OHF-Voice/piper1-gpl) voice model into `tools/piper/voices/` per agent — any language, any voice.
 4. **Your own secrets stay local.** Copy `token.local.bat.example` → `token.local.bat` with your own Claude Code token. Never commit the real file — `.gitignore` already excludes anything matching `*.local.*`.
-5. **Start it.** `start.bat` on the hub, `start-node.bat` on every node.
-6. **Install the face.** In a browser with [Tampermonkey](https://www.tampermonkey.net/) installed, open `http://localhost:8787/agent-face-overlay.user.js` on that machine — each machine serves its own overlay, and Tampermonkey updates itself from there whenever it changes.
+5. **Start it.** `start.bat` on the hub, `start-node.bat` on every Windows node, `bash start-node.sh` on a Linux node or a phone.
+6. **Open the face.** Open `http://localhost:8787/` in any browser on that machine — every machine serves its own face page, no browser extension needed.
+7. **Decide what the agent may do.** The shield button on the face page lists that machine's agent's permissions: web search, the browser, presentations, receiving files, involving other agents, the command line, and so on. Every change is confirmed in a dialog of the operating system that names exactly what changes -- Windows Hello on a PC, the fingerprint prompt on a phone (needs the Termux:API app, as the voice does). No agent and no other machine can change them, and an agent that controls the browser cannot reword what you confirm.
+8. **Updates come by themselves.** Each agent checks this repository at start and once a day. When a newer signed version exists, its face page says so; Install asks for Windows Hello or the fingerprint, naming the version, and the agent restarts once it is idle. Only versions signed with the release key on the maintainer's PC are installed -- see `publish-release.js`. Settings, keys and conversations are never touched.
 
 Talk to the hub's microphone button and the network takes it from there.
 
@@ -84,6 +86,8 @@ enroll.bat 192.168.178.90 K7QF-2M9X-BTLR ada
 ```
 
 That machine generates its own key pair locally and joins — **no private key is ever copied between machines**, and the hub picks it up without a restart. The code exists to prove the exchange is happening with the machine you're standing at rather than someone else on the network: it's mixed into a proof covering both certificates, so a relayed handshake doesn't verify. (`/provision <name>` on the hub console does the same thing without the microphone.)
+
+**A phone as a node.** An Android phone runs an agent through [Termux](https://termux.dev/), without root. Clone the repository on the phone and run `bash setup-termux.sh` once — it installs what is needed and checks that Claude Code starts and receives its prompts intact — then enroll with `node enroll.js <hub-ip> <code> <name>` and start with `bash start-node.sh`. A phone speaks with its own text-to-speech engine, so it needs no voice model.
 
 ## Roadmap
 

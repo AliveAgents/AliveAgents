@@ -2,9 +2,9 @@
 // Files a human hands to a specific agent, landing in that agent's own inbox/ folder on the
 // machine where it actually runs -- so its Claude session can read them as ordinary local files.
 //
-// Deliberately NOT inside presented_content/: that folder is served over plain HTTP to every
-// machine on the LAN (see serveContent in overlay-server.js), which is right for a slide deck and
-// wrong for a photo someone handed to one agent in particular. inbox/ is never served, and the
+// Deliberately NOT inside presented_content/: pages written there travel to whichever screen shows
+// them (see readOwnContent in overlay-server.js), which is right for a slide deck and wrong for a
+// photo someone handed to one agent in particular. inbox/ is never served, and the
 // agent gets write access to exactly it (Edit(inbox/**)), so it can also move, rename or clean up
 // what it finds there.
 //
@@ -77,24 +77,18 @@ function listInbox(root) {
     .sort((a, b) => a.mtimeMs - b.mtimeMs);
 }
 
-// The sentence an agent gets on a turn where its inbox is not empty.
+// What an agent is told about its inbox in a message: only that something NEW arrived, and only
+// on the turn right after it did.
 //
-// Rebuilt from the folder on EVERY turn rather than tracked as a pending list: if the agent moved
-// or deleted something last turn, that has to be reflected, and a stale list would have it
-// reasoning about files that are no longer there. Files that arrived since the previous turn are
-// marked, so "what's new" stays answerable without a separate bookkeeping file.
-// dirLabel: how the folder is named to the model. Defaults to the relative "inbox", which is
-// correct while the agent runs in this folder -- but an agent with a workDir pointing at a real
-// project would resolve that against the project and look in the wrong place, so the caller passes
-// an absolute path in that case.
-function buildInboxLine(files, newNames, dirLabel = 'inbox') {
-  if (!files.length) return '';
-  const parts = files.map((f) => {
-    const isNew = newNames && newNames.has(f.name);
-    return `${f.name} (${humanSize(f.size)})${isNew ? ' [NEW]' : ''}`;
-  });
-  const anyNew = files.some((f) => newNames && newNames.has(f.name));
-  return `Files in your ${dirLabel}/ folder: ${parts.join(', ')}. ${anyNew ? 'The ones marked [NEW] arrived since your last reply. ' : ''}Read whichever are relevant to what was just asked and answer based on them. You may also move, rename or delete files in ${dirLabel}/ if that is what was asked -- it is yours to work in.`;
+// This used to list every file in the folder on every turn, together with the rules for handling
+// them -- restating standing facts in a conversation that keeps everything it is ever told. The
+// rules now live in the inbox skill (agent-skills/inbox), which also names the folder, and the agent
+// lists it itself when a request calls for it. What remains here is an event, and an event stays
+// true forever.
+function buildInboxEvent(files, newNames) {
+  const fresh = (files || []).filter((f) => newNames && newNames.has(f.name));
+  if (!fresh.length) return '';
+  return `(New in your inbox since your last reply: ${fresh.map((f) => `${f.name} (${humanSize(f.size)})`).join(', ')}.)`;
 }
 
 // -- Sending (hub side) ------------------------------------------------------------------------
@@ -173,4 +167,4 @@ function createReceiver({ root, log = console.log, onComplete }) {
   };
 }
 
-module.exports = { inboxDir, ensureInbox, listInbox, buildInboxLine, sendFile, createReceiver, safeName, humanSize, CHUNK_BYTES };
+module.exports = { inboxDir, ensureInbox, listInbox, buildInboxEvent, sendFile, createReceiver, safeName, humanSize, CHUNK_BYTES };

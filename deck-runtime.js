@@ -64,6 +64,79 @@
     document.body.appendChild(nav);
   }
 
+  // The safety net for a slide that does not fit the screen it lands on (user's decision,
+  // 2026-09-15). The runtime's own styles scale with the viewport, but an agent's styling may not:
+  // fixed pixel sizes chosen for a big screen make a phone's slide wider or taller than the screen,
+  // and it gets cut off. So the active slide is measured and, only when its content overflows, laid
+  // out larger and scaled back down as a whole until it fits. Nothing is ever scaled up, a slide
+  // that already fits is left untouched, and below MIN_FIT it stops shrinking and scrolls instead --
+  // text smaller than that is not readable anyway. Turning the device re-runs it (resize), which is
+  // why the screen class sent over the network does not need to know which way up it is.
+  //
+  // Measured as the union of EVERYTHING on the slide, not with scrollHeight and not just the slide's
+  // own children. scrollHeight misses content that a vertically centred slide pushes out above its
+  // top. Direct children miss nested overflow: a row of fixed-width boxes inside a full-width flex
+  // row overflows the row, not the slide, so only the boxes' own rectangles show it -- the first
+  // browser test measured exactly such a slide as fitting while it was visibly cut off. The inner
+  // parts of an <svg> are skipped (the <svg> itself counts as one box), so a chart made of
+  // thousands of paths does not turn every slide change into thousands of measurements. The real
+  // screen size is used only here, inside the slide frame; it never leaves this page.
+  var MIN_FIT = 0.4;
+  var fitTimer = null;
+
+  function measure(slide, scale) {
+    var cs = window.getComputedStyle(slide);
+    var top = Infinity, bottom = -Infinity, left = Infinity, right = -Infinity;
+    var parts = slide.querySelectorAll('*');
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i].ownerSVGElement) continue;
+      var r = parts[i].getBoundingClientRect();
+      if (!r.width && !r.height) continue;
+      if (r.top < top) top = r.top;
+      if (r.bottom > bottom) bottom = r.bottom;
+      if (r.left < left) left = r.left;
+      if (r.right > right) right = r.right;
+    }
+    if (top === Infinity) return null;
+    // Rectangles come back in screen pixels, after the scale; the slide's own size and padding are
+    // in layout pixels, so the scale is divided back out before the two are compared.
+    return {
+      needW: (right - left) / scale,
+      needH: (bottom - top) / scale,
+      availW: slide.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight),
+      availH: slide.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom)
+    };
+  }
+
+  function fit(slide) {
+    if (!slide) return;
+    slide.style.scale = '';
+    slide.style.transformOrigin = '';
+    slide.style.width = '';
+    slide.style.height = '';
+    var scale = 1;
+    for (var pass = 0; pass < 3; pass++) {
+      var m = measure(slide, scale);
+      if (!m || m.availW <= 0 || m.availH <= 0 || !m.needW || !m.needH) return;
+      var ratio = Math.min(m.availW / m.needW, m.availH / m.needH);
+      if (ratio >= 0.99) return;
+      scale = Math.max(MIN_FIT, scale * ratio);
+      slide.style.transformOrigin = '0 0';
+      slide.style.scale = String(scale);
+      slide.style.width = (100 / scale) + '%';
+      slide.style.height = (100 / scale) + '%';
+      if (scale === MIN_FIT) return;
+    }
+  }
+
+  function scheduleFit() {
+    if (fitTimer) window.cancelAnimationFrame(fitTimer);
+    fitTimer = window.requestAnimationFrame(function () {
+      fitTimer = null;
+      fit(slides[current]);
+    });
+  }
+
   function go(index) {
     if (!slides.length) return;
     // Clamped rather than wrapped: an agent that miscounts its own [SLIDE] markers and asks for
@@ -78,6 +151,7 @@
     if (counter) counter.textContent = (target + 1) + ' / ' + slides.length;
     if (prevBtn) prevBtn.disabled = target === 0;
     if (nextBtn) nextBtn.disabled = target === slides.length - 1;
+    scheduleFit();
   }
 
   function onKey(e) {
@@ -148,6 +222,11 @@
     document.addEventListener('touchstart', onTouchStart, { passive: true });
     document.addEventListener('touchend', onTouchEnd, { passive: true });
     window.addEventListener('message', onMessage);
+    window.addEventListener('resize', scheduleFit);
+    window.addEventListener('load', scheduleFit);
+    // Images and web fonts change a slide's size after it was first measured.
+    document.addEventListener('load', function (e) { if (e.target && e.target.tagName === 'IMG') scheduleFit(); }, true);
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(scheduleFit);
     // Without this the iframe has no focus until someone clicks it, and the arrow keys would go
     // to the host page instead -- the deck would look interactive but ignore the keyboard.
     try { window.focus(); } catch (err) {}

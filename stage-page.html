@@ -18,6 +18,9 @@
      the overlay's iframe covers the whole viewport, which hides the rail -- correct, nobody drops
      files mid-presentation. */
   html, body { margin: 0; height: 100%; background: #000; }
+  /* The hidden attribute loses to any display rule of the element's own (display:flex on the setup box
+     and the fullscreen button) -- found in the browser, where the code field stayed after setup. */
+  [hidden] { display: none !important; }
 
   #drop-rail {
     position: fixed; left: 18px; bottom: 18px; z-index: 1000;
@@ -104,11 +107,199 @@
     font: inherit; font-size: .85rem; font-weight: 600; cursor: pointer;
   }
   .chat-input button:disabled { opacity: .4; cursor: default; }
+
+  /* -- Fullscreen ----------------------------------------------------------------------------------
+     Stacked above the microphone button and styled like it, on the same topmost layer as the
+     decisions, so it stays reachable during a presentation. Hidden where the browser cannot do
+     fullscreen for a page at all (an iPhone). */
+  #fullscreen-btn {
+    position: fixed; right: 26px; bottom: 92px; z-index: 2147483647;
+    width: 54px; height: 54px; border-radius: 50%; border: 2px solid currentColor;
+    background: rgba(10,10,14,.7); color: #e5e5e5; cursor: pointer; padding: 0;
+    display: flex; align-items: center; justify-content: center;
+    opacity: .6; transition: opacity .15s ease, transform .15s ease;
+  }
+  #fullscreen-btn:hover, #fullscreen-btn:focus-visible { opacity: 1; transform: scale(1.07); }
+  #fullscreen-btn:focus-visible { outline: 2px solid #7fd1e8; outline-offset: 3px; }
+  #fullscreen-btn svg { width: 22px; height: 22px; }
+  #fullscreen-btn .exit { display: none; }
+  #fullscreen-btn.active .enter { display: none; }
+  #fullscreen-btn.active .exit { display: block; }
+
+  /* -- Decisions waiting for you ---------------------------------------------------------------
+     An agent asking to change its name or responsibility, or a machine the hub has no record of.
+     Top centre, and above everything -- the face and a running presentation included: the overlay
+     sits at the highest z-index there is, so these take the same one and are moved to the very end
+     of the document (renderDecisions), which puts them on top. Nothing on screen, least of all an agent's
+     presentation, may cover a decision that waits for a person. A click only asks: the hub's own
+     confirmation dialog states the decision, and nothing is decided before the user says yes there. */
+  #decisions {
+    position: fixed; top: 18px; left: 50%; transform: translateX(-50%); z-index: 2147483647;
+    display: flex; flex-direction: column; gap: 10px;
+    width: 440px; max-width: calc(100vw - 36px);
+    font-family: "Segoe UI", -apple-system, Helvetica, Arial, sans-serif;
+  }
+  .decision {
+    background: #12151b; border: 1px solid #2b2e38; border-top: 3px solid #f2a62c;
+    border-radius: 11px; padding: .8rem .95rem; box-shadow: 0 10px 40px rgba(0,0,0,.6);
+  }
+  .decision h2 { margin: 0 0 .2rem; font-size: .95rem; color: #e9ebf0; font-weight: 600; }
+  .decision .machine { color: #6d7484; font-size: .72rem; letter-spacing: .06em; text-transform: uppercase; margin-bottom: .55rem; }
+  .decision dl { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: .3rem .8rem; font-size: .84rem; }
+  .decision dt { color: #99a0ae; }
+  .decision dd { margin: 0; color: #e9ebf0; overflow-wrap: anywhere; }
+  .decision .was { display: block; color: #6d7484; text-decoration: line-through; }
+  .decision .actions { display: flex; gap: .5rem; justify-content: flex-end; margin-top: .8rem; }
+  .decision button {
+    border-radius: 7px; padding: .38rem 1rem; font: inherit; font-size: .85rem; font-weight: 600;
+    cursor: pointer; border: 1px solid #2b2e38;
+  }
+  .decision .accept { background: #6ee7a8; color: #0b0c10; border-color: #6ee7a8; }
+  .decision .decline { background: none; color: #e9ebf0; }
+  .decision .decline:hover { border-color: #ff8a5c; }
+  .decision button:disabled { opacity: .45; cursor: default; }
+  .decision button:focus-visible { outline: 2px solid #7fd1e8; outline-offset: 2px; }
+  .decision .err { color: #ff8a5c; font-size: .78rem; margin-top: .55rem; }
+  .decision .err.wait { color: #7fd1e8; }
+
+  /* -- What this agent may do -------------------------------------------------------------------
+     Above the fullscreen button, same look. An amber dot on it when this device has no dialog to
+     confirm a change with. Only this device's own page can ask for a change (overlay-server.js), and
+     none counts until the operating system's own dialog has named it and the user said yes there
+     (device-confirm.js). */
+  #perm-btn {
+    position: fixed; right: 26px; bottom: 158px; z-index: 2147483647;
+    width: 54px; height: 54px; border-radius: 50%; border: 2px solid currentColor;
+    background: rgba(10,10,14,.7); color: #e5e5e5; cursor: pointer; padding: 0;
+    display: flex; align-items: center; justify-content: center;
+    opacity: .6; transition: opacity .15s ease, transform .15s ease;
+  }
+  #perm-btn:hover, #perm-btn:focus-visible, #perm-btn.open { opacity: 1; }
+  #perm-btn:hover, #perm-btn:focus-visible { transform: scale(1.07); }
+  #perm-btn:focus-visible { outline: 2px solid #7fd1e8; outline-offset: 3px; }
+  #perm-btn svg { width: 23px; height: 23px; }
+  #perm-btn.warn::after {
+    content: ''; position: absolute; top: 3px; right: 3px; width: 11px; height: 11px;
+    border-radius: 50%; background: #f2a62c; box-shadow: 0 0 0 2px #0a0a0e;
+  }
+
+  #perm-panel {
+    position: fixed; right: 96px; bottom: 26px; z-index: 2147483647;
+    width: 410px; max-width: calc(100vw - 36px); max-height: calc(100vh - 52px);
+    background: #12151b; border: 1px solid #2b2e38; border-radius: 11px;
+    display: none; flex-direction: column; overflow: hidden;
+    font-family: "Segoe UI", -apple-system, Helvetica, Arial, sans-serif;
+    box-shadow: 0 10px 40px rgba(0,0,0,.6);
+  }
+  #perm-panel.open { display: flex; }
+  @media (max-width: 560px) {
+    #perm-panel { left: 12px; right: 12px; bottom: 12px; width: auto; max-width: none; max-height: calc(100vh - 24px); }
+  }
+  .perm-head {
+    display: flex; align-items: center; gap: .5rem; padding: .65rem .8rem;
+    border-bottom: 1px solid #2b2e38; color: #e9ebf0; font-size: .92rem; font-weight: 600;
+  }
+  .perm-head .close {
+    margin-left: auto; background: none; border: 0; color: #99a0ae; cursor: pointer;
+    font-size: 1.1rem; line-height: 1; padding: 0 .2rem; font-family: inherit;
+  }
+  .perm-head .close:hover { color: #e9ebf0; }
+  .perm-state {
+    display: flex; gap: .55rem; align-items: flex-start; padding: .6rem .8rem;
+    font-size: .8rem; line-height: 1.45; color: #c3c8d2; border-bottom: 1px solid #2b2e38;
+  }
+  .perm-state .dot { margin-top: .38rem; }
+  .perm-state.warn .dot { background: #f2a62c; }
+  .perm-state.bad .dot { background: #ff8a5c; }
+  .perm-state a { color: #7fd1e8; }
+  .perm-state.wait .dot { background: #6d7484; }
+  .perm-list { overflow-y: auto; padding: .25rem 0; }
+  .perm-item {
+    display: grid; grid-template-columns: auto 1fr; column-gap: .65rem; row-gap: .1rem;
+    padding: .42rem .8rem; cursor: pointer; align-items: start;
+  }
+  .perm-item:hover { background: rgba(127,209,232,.05); }
+  .perm-item.locked { cursor: default; }
+  .perm-item.locked:hover { background: none; }
+  .perm-item input { width: 16px; height: 16px; margin: .12rem 0 0; accent-color: #7fd1e8; cursor: inherit; }
+  .perm-item .label { color: #e9ebf0; font-size: .86rem; }
+  .perm-item.locked .label { color: #99a0ae; }
+  .perm-item .note { grid-column: 2; color: #6d7484; font-size: .74rem; line-height: 1.4; }
+  .perm-item.danger .label { color: #ff8a5c; }
+  .perm-item.danger .note { color: #c98a76; }
+  .perm-item.danger input { accent-color: #ff8a5c; }
+  .perm-item .changed { color: #f2a62c; font-size: .7rem; letter-spacing: .05em; text-transform: uppercase; margin-left: .35rem; }
+  .perm-foot { display: flex; gap: .6rem; align-items: center; padding: .6rem .8rem; border-top: 1px solid #2b2e38; }
+  .perm-foot .note { flex: 1; font-size: .76rem; color: #99a0ae; min-height: 1.1em; }
+  .perm-foot .note.ok { color: #6ee7a8; }
+  .perm-foot .note.bad { color: #ff8a5c; }
+  .perm-btn-primary {
+    background: #7fd1e8; color: #0b0c10; border: 1px solid #7fd1e8; border-radius: 7px; padding: .38rem .95rem;
+    font: inherit; font-size: .85rem; font-weight: 600; cursor: pointer; white-space: nowrap;
+  }
+  .perm-btn-quiet {
+    background: none; color: #e9ebf0; border: 1px solid #2b2e38; border-radius: 7px; padding: .38rem .8rem;
+    font: inherit; font-size: .85rem; cursor: pointer; white-space: nowrap;
+  }
+  .perm-btn-primary:disabled, .perm-btn-quiet:disabled { opacity: .4; cursor: default; }
+  .perm-btn-primary:focus-visible, .perm-btn-quiet:focus-visible { outline: 2px solid #7fd1e8; outline-offset: 2px; }
+
+  /* -- A newer version of this agent's own program ------------------------------------------------
+     Top right, only while there is something to do or to know (updater.js). Checking, being current
+     and having no network stay quiet. Same topmost layer as the decisions. */
+  #update-note {
+    position: fixed; top: 18px; right: 18px; z-index: 2147483647;
+    width: 330px; max-width: calc(100vw - 36px); box-sizing: border-box;
+    display: flex; flex-direction: column; gap: .45rem;
+    background: #12151b; border: 1px solid #2b2e38; border-top: 3px solid #7fd1e8; border-radius: 11px;
+    padding: .75rem .9rem; box-shadow: 0 10px 40px rgba(0,0,0,.6);
+    font-family: "Segoe UI", -apple-system, Helvetica, Arial, sans-serif; color: #e9ebf0;
+  }
+  #update-note .update-title { font-size: .92rem; font-weight: 600; display: flex; align-items: center; gap: .5rem; }
+  #update-note .update-title .close { margin-left: auto; background: none; border: 0; color: #99a0ae; cursor: pointer; font-size: 1.1rem; line-height: 1; padding: 0 .2rem; font-family: inherit; }
+  #update-note .update-title .close:hover { color: #e9ebf0; }
+  #update-note .update-body { font-size: .8rem; line-height: 1.45; color: #c3c8d2; }
+  #update-note .update-meta { font-size: .72rem; color: #6d7484; font-variant-numeric: tabular-nums; }
+  #update-note .update-actions { display: flex; gap: .6rem; align-items: center; }
+  #update-note .update-msg { flex: 1; font-size: .76rem; color: #ff8a5c; min-height: 1em; }
+  #update-note .update-msg.wait { color: #7fd1e8; }
 </style>
 </head>
 <body>
 
+<!-- The face, served by this machine's own agent rather than injected by a browser extension.
+     AGENT_SERVER_ORIGIN tells the script which server it belongs to; without it the script falls
+     back to localhost, which is what it needs as a Tampermonkey userscript on foreign pages.
+     Loading it here means any browser shows the face with nothing installed -- which is the only
+     practical option on a phone, and one less moving part everywhere else. -->
+<script>window.AGENT_SERVER_ORIGIN = location.origin;</script>
+<script src="/agent-face-overlay.user.js"></script>
+
 <div id="drop-rail" class="hidden"><div class="rail-title">Agents</div></div>
+
+<div id="decisions" aria-live="polite"></div>
+
+<button id="fullscreen-btn" type="button" title="Fullscreen" aria-label="Fullscreen" hidden>
+  <svg class="enter" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+  <svg class="exit" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/></svg>
+</button>
+
+<button id="perm-btn" type="button" title="What this agent may do" aria-label="What this agent may do" aria-controls="perm-panel" aria-expanded="false">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l7 3v5c0 4.6-3 8.4-7 10-4-1.6-7-5.4-7-10V6z"/><path d="M9 12l2 2 4-4"/></svg>
+</button>
+
+<div id="perm-panel" role="dialog" aria-labelledby="perm-title">
+  <div class="perm-head"><span id="perm-title">What this agent may do</span><button class="close" type="button" aria-label="Close">×</button></div>
+  <div class="perm-state" id="perm-state"><span class="dot"></span><span id="perm-state-text">Loading…</span></div>
+  <div class="perm-list" id="perm-list"></div>
+  <div class="perm-foot">
+    <span class="note" id="perm-note"></span>
+    <button class="perm-btn-quiet" id="perm-undo" type="button" hidden>Undo</button>
+    <button class="perm-btn-primary" id="perm-save" type="button" hidden>Save</button>
+  </div>
+</div>
+
+<div id="update-note" role="status" hidden></div>
 
 <div id="chat">
   <div class="chat-head"><span class="dot"></span><span id="chat-name"></span><button class="close" type="button" aria-label="Close">×</button></div>
@@ -224,9 +415,17 @@
 
   function connect() {
     socket = new WebSocket('ws://' + location.host);
-    socket.onopen = () => socket.send(JSON.stringify({ type: 'subscribe-chat' }));
+    socket.onopen = () => {
+      socket.send(JSON.stringify({ type: 'subscribe-chat' }));
+      refreshPermissions();
+      refreshUpdate();
+    };
     socket.onmessage = (ev) => {
       let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (m && m.type === 'page-reply') { const done = waiting.get(m.reqId); if (done) { waiting.delete(m.reqId); done(m); } return; }
+      if (m && m.type === 'permissions' && m.status) { showPermissions(m.status); return; }
+      if (m && m.type === 'update' && m.update) { showUpdate(m.update); return; }
+      if (m && m.type === 'decisions' && Array.isArray(m.list)) { renderDecisions(m.list); return; }
       if (!m || m.type !== 'chat' || !m.agent) return;
       // "you" entries are echoed back by the server, but the panel already showed them optimistically.
       if (m.from === 'you') { markSent(m.agent, m.text); return; }
@@ -295,6 +494,376 @@
     textEl.value = '';
     textEl.style.height = '';
     render();
+  }
+
+  // -- Fullscreen --------------------------------------------------------------------------------
+  // The whole document goes fullscreen, not the face: the overlay's elements hang off <html> itself,
+  // and the presentation frame, the decisions and this button have to come along.
+  const fsBtn = document.getElementById('fullscreen-btn');
+  const root = document.documentElement;
+  const fsSupported = !!(document.fullscreenEnabled || document.webkitFullscreenEnabled);
+  const fsElement = () => document.fullscreenElement || document.webkitFullscreenElement;
+  function syncFullscreen() {
+    const on = !!fsElement();
+    fsBtn.classList.toggle('active', on);
+    fsBtn.title = on ? 'Leave fullscreen' : 'Fullscreen';
+    fsBtn.setAttribute('aria-label', fsBtn.title);
+  }
+  if (fsSupported) {
+    fsBtn.hidden = false;
+    // Same topmost layer as the overlay, so document order decides -- see renderDecisions below.
+    root.appendChild(fsBtn);
+    fsBtn.addEventListener('click', () => {
+      if (fsElement()) {
+        (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+      } else {
+        const request = root.requestFullscreen || root.webkitRequestFullscreen;
+        const result = request.call(root, { navigationUI: 'hide' });
+        if (result && result.catch) result.catch(() => {});
+      }
+    });
+    document.addEventListener('fullscreenchange', syncFullscreen);
+    document.addEventListener('webkitfullscreenchange', syncFullscreen);
+    syncFullscreen();
+  }
+
+  // -- Decisions ---------------------------------------------------------------------------------
+  // Everything in a card is set with textContent: the name, responsibility and reason come from an
+  // agent, and here they are only ever words to read.
+  const decisionsEl = document.getElementById('decisions');
+  const decisionNotes = new Map(); // card id -> { text, wait }: what a card shows while and after asking
+  let lastDecisions = [];
+
+  function addRow(dl, label, value, was) {
+    const dt = document.createElement('dt');
+    dt.textContent = label;
+    const dd = document.createElement('dd');
+    if (was !== undefined) {
+      const old = document.createElement('span');
+      old.className = 'was';
+      old.textContent = was || '(nothing)';
+      dd.appendChild(old);
+    }
+    dd.appendChild(document.createTextNode(value || '(nothing)'));
+    dl.append(dt, dd);
+  }
+
+  function renderDecisions(list) {
+    // Same z-index as the face overlay, so document order decides and the last one wins. The overlay
+    // appends its elements to <html> itself, after <body> (see mount() in agent-face-overlay.user.js),
+    // so the end of the body is not late enough -- found in the browser, where the face's frame
+    // still cut through the buttons.
+    if (document.documentElement.lastElementChild !== decisionsEl) document.documentElement.appendChild(decisionsEl);
+    lastDecisions = list;
+    for (const id of decisionNotes.keys()) {
+      if (!list.some((d) => d.id === id)) decisionNotes.delete(id);
+    }
+    decisionsEl.innerHTML = '';
+    for (const d of list) {
+      const card = document.createElement('div');
+      card.className = 'decision';
+      const title = document.createElement('h2');
+      const machine = document.createElement('div');
+      machine.className = 'machine';
+      machine.textContent = 'Machine: ' + d.machine;
+      const dl = document.createElement('dl');
+      if (d.kind === 'request') {
+        title.textContent = d.currentName + ' asks for a change';
+        if (d.name !== d.currentName) addRow(dl, 'Name', d.name, d.currentName);
+        if (d.domain !== d.currentDomain) addRow(dl, 'Responsible for', d.domain, d.currentDomain);
+        addRow(dl, 'Reason', d.reason);
+      } else {
+        title.textContent = 'Not confirmed yet';
+        addRow(dl, 'Name', d.name || d.currentName);
+        addRow(dl, 'Responsible for', d.domain);
+      }
+      const actions = document.createElement('div');
+      actions.className = 'actions';
+      const decline = document.createElement('button');
+      decline.type = 'button'; decline.className = 'decline'; decline.textContent = 'Decline';
+      const accept = document.createElement('button');
+      accept.type = 'button'; accept.className = 'accept'; accept.textContent = 'Accept';
+      const err = document.createElement('div');
+      err.className = 'err';
+      err.hidden = true;
+      const shown = decisionNotes.get(d.id);
+      if (shown) {
+        err.hidden = false;
+        err.className = 'err' + (shown.wait ? ' wait' : '');
+        err.textContent = shown.text;
+        accept.disabled = decline.disabled = !!shown.wait;
+      }
+      // A click only asks. The hub's own confirmation dialog states what this card decides, and the card
+      // waits for its answer here -- kept by id, since a fresh list may redraw the card meanwhile.
+      const answer = async (yes) => {
+        decisionNotes.set(d.id, { text: 'Confirm in the dialog that opens. It names exactly what happens -- if it says anything else, cancel.', wait: true });
+        renderDecisions(lastDecisions);
+        try {
+          const r = await request('decide', { id: d.id, accept: yes }, CONFIRM_WAIT_MS);
+          if (r.error) throw new Error(r.error);
+          decisionNotes.delete(d.id);
+        } catch (e) {
+          decisionNotes.set(d.id, { text: e.message });
+        }
+        renderDecisions(lastDecisions);
+      };
+      accept.addEventListener('click', () => answer(true));
+      decline.addEventListener('click', () => answer(false));
+      actions.append(decline, accept);
+      card.append(title, machine, dl, actions, err);
+      decisionsEl.appendChild(card);
+    }
+  }
+
+  // -- What this agent may do -----------------------------------------------------------------------
+  // The page shows the switches and says which ones the user wants -- it is trusted with nothing more. An
+  // agent allowed to control the browser can run script here and reword anything on this page, so the
+  // agent's own process words the change itself and has the operating system confirm it in a dialog that
+  // names it (permissions.js, device-confirm.js). The decision cards above work the same way.
+  const CONFIRM_WAIT_MS = 170000; // a little longer than the dialog may stay open
+  const waiting = new Map(); // reqId -> resolve
+  let requestCounter = 0;
+  function request(type, data, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      if (!socket || socket.readyState !== WebSocket.OPEN) { reject(new Error('Not connected right now. Try again in a moment.')); return; }
+      const reqId = 'q' + (++requestCounter) + '-' + Math.random().toString(36).slice(2, 10);
+      const timer = setTimeout(() => { waiting.delete(reqId); reject(new Error('No answer from this device. Is it up to date?')); }, timeoutMs || 15000);
+      waiting.set(reqId, (m) => { clearTimeout(timer); resolve(m); });
+      socket.send(JSON.stringify(Object.assign({}, data, { type, reqId })));
+    });
+  }
+
+  const permBtn = document.getElementById('perm-btn');
+  const permPanel = document.getElementById('perm-panel');
+  const permTitle = document.getElementById('perm-title');
+  const permState = document.getElementById('perm-state');
+  const permStateText = document.getElementById('perm-state-text');
+  const permList = document.getElementById('perm-list');
+  const permNote = document.getElementById('perm-note');
+  const permSave = document.getElementById('perm-save');
+  const permUndo = document.getElementById('perm-undo');
+  let permStatus = null; // as the device last reported it
+  let permDraft = null;  // key -> boolean, only while something is being changed
+  let permBusy = false;
+  root.appendChild(permBtn); // the same topmost layer as the fullscreen button
+
+  function note(text, kind) {
+    permNote.className = 'note' + (kind ? ' ' + kind : '');
+    permNote.textContent = text;
+  }
+
+  async function refreshPermissions() {
+    try {
+      const m = await request('permissions-get', {});
+      if (m.status) showPermissions(m.status);
+    } catch (e) { /* an agent from before permissions: the button stays plain */ }
+  }
+
+  function showPermissions(status) {
+    permStatus = status;
+    if (permDraft && status.items.every((it) => permDraft[it.key] === it.value)) permDraft = null;
+    const confirm = status.confirm || {};
+    permBtn.classList.toggle('warn', !!confirm.checked && !confirm.available);
+    if (permPanel.classList.contains('open')) renderPermissions();
+  }
+
+  function values() {
+    const v = {};
+    for (const it of permStatus.items) v[it.key] = permDraft && it.key in permDraft ? !!permDraft[it.key] : it.value;
+    return v;
+  }
+  const isDirty = () => !!permDraft && permStatus.items.some((it) => !!permDraft[it.key] !== it.value);
+
+  function renderPermissions() {
+    const s = permStatus;
+    if (!s) return;
+    const confirm = s.confirm || {};
+    const canChange = !!confirm.available;
+    permTitle.textContent = 'What ' + s.agentName + ' may do';
+    permState.className = 'perm-state' + (!confirm.checked ? ' wait' : canChange ? '' : ' warn');
+    permStateText.textContent = !confirm.checked
+      ? 'Checking how changes can be confirmed on this device…'
+      : canChange
+        ? 'Every change is confirmed with ' + confirm.label + ', in a dialog outside the browser that names exactly what changes. Nothing counts before that.'
+        : (confirm.problem || 'This device has no confirmation dialog.') + ' Nothing can be changed here until then.';
+
+    const focused = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.key : null;
+    permList.textContent = '';
+    const v = values();
+    for (const it of s.items) {
+      const row = document.createElement('label');
+      row.className = 'perm-item' + (it.danger ? ' danger' : '') + (canChange ? '' : ' locked');
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.checked = v[it.key];
+      box.disabled = !canChange || permBusy;
+      box.dataset.key = it.key;
+      box.addEventListener('change', () => {
+        permDraft = Object.assign(values(), { [it.key]: box.checked });
+        note('');
+        renderPermissions();
+      });
+      const label = document.createElement('span');
+      label.className = 'label';
+      label.textContent = it.label;
+      if (permDraft && v[it.key] !== it.value) {
+        const changed = document.createElement('span');
+        changed.className = 'changed';
+        changed.textContent = 'changed';
+        label.appendChild(changed);
+      }
+      row.append(box, label);
+      if (it.danger || it.note) {
+        const text = document.createElement('span');
+        text.className = 'note';
+        text.textContent = it.danger || it.note;
+        row.appendChild(text);
+      }
+      permList.appendChild(row);
+      if (focused === it.key) box.focus();
+    }
+
+    const dirty = isDirty();
+    permSave.hidden = !canChange;
+    permSave.disabled = permBusy || !dirty;
+    permUndo.hidden = !dirty;
+    permUndo.disabled = permBusy;
+  }
+
+  function setBusy(busy) {
+    permBusy = busy;
+    renderPermissions();
+  }
+
+  function openPermissions() {
+    root.appendChild(permPanel); // last in the document, so nothing on the same layer covers it
+    permPanel.classList.add('open');
+    permBtn.classList.add('open');
+    permBtn.setAttribute('aria-expanded', 'true');
+    if (!permBusy) note('');
+    if (permStatus) renderPermissions();
+    refreshPermissions().then(() => {
+      if (!permStatus) permStateText.textContent = 'This agent does not offer permissions yet. It needs the latest update.';
+    });
+  }
+  function closePermissions() {
+    permPanel.classList.remove('open');
+    permBtn.classList.remove('open');
+    permBtn.setAttribute('aria-expanded', 'false');
+    if (!permBusy) permDraft = null; // closing drops unsaved changes
+  }
+
+  permBtn.addEventListener('click', () => (permPanel.classList.contains('open') ? closePermissions() : openPermissions()));
+  permPanel.querySelector('.close').addEventListener('click', closePermissions);
+  permPanel.addEventListener('keydown', (e) => { if (e.key === 'Escape') closePermissions(); });
+  permUndo.addEventListener('click', () => { permDraft = null; note(''); renderPermissions(); });
+  permSave.addEventListener('click', async () => {
+    if (!permStatus || permBusy) return;
+    const label = (permStatus.confirm && permStatus.confirm.label) || 'the confirmation dialog';
+    setBusy(true);
+    note('Confirm with ' + label + '. The dialog names exactly what changes -- if it says anything else, cancel.');
+    try {
+      const r = await request('permissions-save', { permissions: values() }, CONFIRM_WAIT_MS);
+      if (r.error) throw new Error(r.error);
+      permDraft = null;
+      note(r.unchanged ? 'Nothing to change.' : 'Saved. ' + permStatus.agentName + ' works with these from its next answer on.', 'ok');
+    } catch (e) {
+      note(e.message, 'bad');
+    } finally {
+      setBusy(false);
+    }
+  });
+
+  // -- A newer version of this agent's own program --------------------------------------------------
+  // The agent checks by itself (updater.js); this only shows what it found. Installing goes through this
+  // device's confirmation dialog, which names the version -- the button alone installs nothing.
+  const updateEl = document.getElementById('update-note');
+  let updateState = null;
+  let updateBusy = false;
+  let updateMsg = { text: '', wait: false };
+  let updateDismissed = '';
+  root.appendChild(updateEl); // the same topmost layer as the other notices
+
+  async function refreshUpdate() {
+    try {
+      const m = await request('update-get', {});
+      if (m.update) showUpdate(m.update);
+    } catch (e) { /* an agent from before updates: nothing to show */ }
+  }
+
+  function showUpdate(update) {
+    updateState = update;
+    renderUpdate();
+  }
+
+  function renderUpdate() {
+    const u = updateState;
+    const version = u && u.latest ? u.latest.version : '';
+    const key = u ? u.status + ' ' + version : '';
+    const shown = !!u && ['available', 'manual', 'installing', 'restarting', 'installed'].includes(u.status) && updateDismissed !== key;
+    updateEl.hidden = !shown;
+    if (!shown) return;
+    updateEl.textContent = '';
+    const name = u.agentName;
+
+    const title = document.createElement('div');
+    title.className = 'update-title';
+    const titleText = document.createElement('span');
+    titleText.textContent = { available: 'Update available', manual: 'Update needs a manual step', installing: 'Installing update', restarting: 'Update installed', installed: 'Update installed' }[u.status];
+    title.appendChild(titleText);
+    if (u.status !== 'installing' && u.status !== 'restarting') {
+      const close = document.createElement('button');
+      close.type = 'button'; close.className = 'close'; close.textContent = '×'; close.setAttribute('aria-label', 'Hide until the next version');
+      close.addEventListener('click', () => { updateDismissed = key; renderUpdate(); });
+      title.appendChild(close);
+    }
+
+    const body = document.createElement('div');
+    body.className = 'update-body';
+    body.textContent = {
+      available: 'Version ' + version + ' of ' + name + '\'s program is ready, ' + u.changedCount + ' files. It installs after you confirm it, and ' + name + ' restarts once it is idle.',
+      manual: 'Version ' + version + ' changes ' + u.manual.join(', ') + ', which cannot be replaced while ' + name + ' is running. Install it by hand.',
+      installing: 'Downloading and checking version ' + version + '…',
+      restarting: 'Version ' + version + ' is in place. ' + name + ' restarts as soon as it is idle.',
+      installed: 'Version ' + version + ' is in place. Restart ' + name + ' to use it: close its window and start it again.'
+    }[u.status];
+
+    const meta = document.createElement('div');
+    meta.className = 'update-meta';
+    meta.textContent = 'Installed: ' + (u.installed || 'a version from before updates') + (u.latest && u.latest.published ? ' · new one published ' + String(u.latest.published).slice(0, 10) : '');
+
+    updateEl.append(title, body, meta);
+    if (u.status === 'available') {
+      const actions = document.createElement('div');
+      actions.className = 'update-actions';
+      const msg = document.createElement('span');
+      msg.className = 'update-msg' + (updateMsg.wait ? ' wait' : '');
+      msg.textContent = updateMsg.text;
+      const install = document.createElement('button');
+      install.type = 'button'; install.className = 'perm-btn-primary'; install.textContent = 'Install';
+      install.disabled = updateBusy;
+      install.addEventListener('click', installUpdate);
+      actions.append(msg, install);
+      updateEl.appendChild(actions);
+    }
+  }
+
+  async function installUpdate() {
+    if (updateBusy) return;
+    updateBusy = true;
+    const label = (permStatus && permStatus.confirm && permStatus.confirm.label) || 'the confirmation dialog';
+    updateMsg = { text: 'Confirm with ' + label + '. The dialog names the version -- if it says anything else, cancel.', wait: true };
+    renderUpdate();
+    try {
+      const r = await request('update-install', {}, CONFIRM_WAIT_MS + 120000);
+      updateMsg = { text: r.error || '', wait: false };
+      if (r.update) updateState = r.update;
+    } catch (e) {
+      updateMsg = { text: e.message, wait: false };
+    } finally {
+      updateBusy = false;
+      renderUpdate();
+    }
   }
 
   sendBtn.addEventListener('click', send);

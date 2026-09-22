@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Agent Face Overlay
 // @namespace    agent-network
-// @version      1.3
+// @version      1.6
 // @description  Shared shell for all agent faces -- automatically loads its own face
 //               (faces/<name>.js from its own local overlay-server.js) on start and briefly
 //               switches to the face of ANOTHER agent when that agent is presenting here
@@ -24,12 +24,27 @@
 (function () {
   'use strict';
 
-  const WS_URL = 'ws://localhost:8787';
-  // Deliberately hardcoded just like WS_URL, NOT derived from location: this script runs via
-  // @match *://*/* on ARBITRARY pages, so location.origin would be whatever foreign page is
-  // currently open, not this script's own overlay server (same reasoning that has always kept
-  // WS_URL hardcoded, here just spelled out explicitly for face loading too for the first time).
-  const FACES_BASE_URL = 'http://localhost:8787';
+  // This file runs in two very different situations, and mounting twice would give you two faces
+  // on top of each other -- which is exactly what happens on the agent's own stage page when
+  // Tampermonkey ALSO has it installed. First one in wins; the second exits immediately.
+  if (window.__agentOverlayMounted) return;
+  window.__agentOverlayMounted = true;
+
+  // Where this agent's own overlay server lives.
+  //
+  // As a Tampermonkey userscript this script runs via @match *://*/* on ARBITRARY pages, so
+  // location would be whatever foreign page happens to be open -- hence the hardcoded fallback.
+  // But when the agent's own stage page loads this file with a <script> tag, location IS the
+  // right server, and the page says so by setting AGENT_SERVER_ORIGIN before loading it.
+  //
+  // That second path is what makes a phone practical: it runs its own agent, so the face is just
+  // a URL in any browser, with no extension to install. Tampermonkey then remains only for the
+  // one thing it is actually needed for -- floating the face over OTHER websites.
+  const SERVER_ORIGIN = typeof window.AGENT_SERVER_ORIGIN === 'string' && window.AGENT_SERVER_ORIGIN
+    ? window.AGENT_SERVER_ORIGIN
+    : 'http://localhost:8787';
+  const WS_URL = SERVER_ORIGIN.replace(/^http/, 'ws');
+  const FACES_BASE_URL = SERVER_ORIGIN;
   const SVG_NS = 'http://www.w3.org/2000/svg';
 
   // -- Overlay markup: the SVG is deliberately left EMPTY -- this script only learns which face
@@ -219,7 +234,7 @@
   // actually running" is answerable in two seconds. An installed userscript does NOT update when
   // the file on disk changes -- it has to be pasted in by hand -- and an out-of-date copy fails in
   // ways that look like a backend bug (a deck that never advances, for instance).
-  const OVERLAY_VERSION = '1.3 (multi-slide, chat-safe)';
+  const OVERLAY_VERSION = '1.6 (screen class)';
 
   function mount() {
     console.log(`[agent-overlay] version ${OVERLAY_VERSION} active`);
@@ -333,11 +348,38 @@
     return promise;
   }
 
+  // -- Per-agent tint.
+  // A face definition brings its own three state colours. An agent may override them, which is
+  // what lets two agents sharing a shell still be told apart from across the room -- and it is
+  // also why this is NOT free-form CSS. The text below lands in a <style> element inside the
+  // overlay's own privileged document, the one with WebSocket and microphone access, which is
+  // exactly why faces/ is closed to agents in the first place. So three keys are read, each has
+  // to be a bare #rrggbb literal, and if any of them is not, the whole tint is dropped in favour
+  // of the face's own palette rather than partially applied. The hub validates this too
+  // (normalizeTint in identity.js); repeating it here is the cheap half of defence in depth, and
+  // the half that still holds if a message ever arrives from somewhere unexpected.
+  const TINT_HEX = /^#[0-9a-fA-F]{6}$/;
+
+  function tintCss(tint) {
+    if (!tint || typeof tint !== 'object') return '';
+    const { idle, thinking, speaking } = tint;
+    for (const v of [idle, thinking, speaking]) {
+      if (typeof v !== 'string' || !TINT_HEX.test(v)) return '';
+    }
+    // Appended AFTER the face's own CSS, so it wins on equal specificity without !important.
+    return '#agent-face-overlay.state-idle{color:' + idle + ';}'
+         + '#agent-face-overlay.state-thinking{color:' + thinking + ';}'
+         + '#agent-face-overlay.state-speaking{color:' + speaking + ';}';
+  }
+
   let mountedFaceName = null; // which face is CURRENTLY actually sitting in the DOM (null = fallback/nothing)
+  let mountedTintCss = ''; // the tint applied alongside it -- part of the identity, so a change in
+  // colour alone still has to re-mount even when the shell stays the same.
   let desiredFaceName = null; // requested by the last applyState call -- set SYNCHRONOUSLY, serves
   // the async load below as an "is my result even still current" check.
 
-  async function mountFace(name) {
+  async function mountFace(name, tint) {
+    const wantTint = tintCss(tint);
     let def, mountedAs;
     if (!name) {
       def = FALLBACK_FACE;
@@ -360,22 +402,25 @@
     // wrong face mounted at the end.
     if (desiredFaceName !== name) return;
     svgEl.innerHTML = def.svgInner;
-    faceStyleEl.textContent = def.css;
+    faceStyleEl.textContent = def.css + wantTint;
     if (typeof def.init === 'function') def.init(box);
     buildMouth(box, def.mouthParams);
     mountedFaceName = mountedAs;
+    mountedTintCss = wantTint;
   }
 
   // Triggered from applyState "fire-and-forget" (not awaited), so name/status/bubble/mic keep
   // updating synchronously right away, while the (async) face loading catches up in the
   // background -- a brief, harmless lag on the very first load or a switch, clearly better than
   // the previous PERMANENT wrong state (wrong face forever).
-  function requestFace(name) {
+  function requestFace(name, tint) {
     desiredFaceName = name;
-    if (name === mountedFaceName) return; // already the right one mounted -- no re-fetch/
+    // The tint counts towards "is the right thing already mounted": without it, an agent taking
+    // over the screen with the same shell but its own colours would keep the previous agent's.
+    if (name === mountedFaceName && tintCss(tint) === mountedTintCss) return; // no re-fetch/
     // rebuild, otherwise applyState firing frequently (several times per conversation turn) would
     // keep re-rolling the once-randomly-rolled mouth timing values, visibly "jittering".
-    mountFace(name);
+    mountFace(name, tint);
   }
 
   const nameEl = box.querySelector('.agent-name');
@@ -400,6 +445,26 @@
 
   // -- WebSocket connection to the bridge server --
   let socket;
+  // The screen this page is shown on, reduced to a CLASS before anything leaves the browser (user's
+  // decision, 2026-09-15). Exact viewport numbers -- 412 x 915 at a pixel ratio of 2.625, say -- pin
+  // a device down to a handful of phone models, a well-known fingerprinting signal, and a presenter
+  // needs none of that: the kind of device and a rough size of its short and long side are enough to
+  // design for. Fitting the last pixel is deck-runtime.js's job, done inside the slide frame with the
+  // real numbers, which never travel.
+  //
+  // Deliberately no orientation, and no reporting on resize: turning a phone would otherwise send a
+  // message and rewrite display.md on every agent in the network, for something the deck handles on
+  // the device itself. So the class is sent once per connection, in the hello, and nothing more.
+  // Only values from these fixed lists are sent; the server discards anything else anyway.
+  function screenClass() {
+    const shortSide = Math.min(window.innerWidth, window.innerHeight);
+    const longSide = Math.max(window.innerWidth, window.innerHeight);
+    const range = (v) => (v < 480 ? 'under-480' : v < 768 ? '480-767' : v < 1024 ? '768-1023' : v < 1440 ? '1024-1439' : '1440-plus');
+    const coarse = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+    const kind = shortSide < 600 ? 'phone' : (coarse && shortSide < 1024 ? 'tablet' : 'large');
+    return { kind, shortSide: range(shortSide), longSide: range(longSide) };
+  }
+
   function connect() {
     socket = new WebSocket(WS_URL);
     // Announces which build of this file the browser is actually running, so the machine can be
@@ -409,7 +474,7 @@
     // changes, and a stale one fails silently in ways that look like a backend fault (a deck that
     // never advances, most of a day spent looking in the wrong place, 2026-08-25).
     socket.onopen = () => {
-      try { socket.send(JSON.stringify({ type: 'client-hello', version: OVERLAY_VERSION })); } catch (e) {}
+      try { socket.send(JSON.stringify({ type: 'client-hello', version: OVERLAY_VERSION, screen: screenClass() })); } catch (e) {}
     };
     socket.onmessage = (ev) => {
       try {
@@ -593,8 +658,12 @@
     const presenting = !!(state.presentation && state.presentation.url);
     box.classList.toggle('presenting', presenting);
     if (presenting) {
-      if (presentationFrame.src !== state.presentation.url) {
-        presentationFrame.src = state.presentation.url;
+      // Resolved before comparing: .src always reads back absolute, so a relative link would never
+      // compare equal and the deck would reload on every state update.
+      let wantedSrc;
+      try { wantedSrc = new URL(state.presentation.url, SERVER_ORIGIN).href; } catch (err) { wantedSrc = 'about:blank'; }
+      if (presentationFrame.src !== wantedSrc) {
+        presentationFrame.src = wantedSrc;
         // A fresh document starts on its own first slide and has no listener yet -- both flags
         // have to go back to their initial state, or a leftover shownSlide from the PREVIOUS
         // presentation would make applySlide() treat the new deck's slide 0 as "already shown".
@@ -620,7 +689,9 @@
     // During someone else's presentation, the face shown here should be that of the ACTUAL
     // presenter, not this screen's own -- otherwise it would look like, say, Nova is speaking,
     // even though it's Oscar's voice/content. Fire-and-forget (see requestFace), no await needed here.
-    requestFace(presenting ? state.presentation.faceStyle : state.faceStyle);
+    requestFace(
+      presenting ? state.presentation.faceStyle : state.faceStyle,
+      presenting ? state.presentation.faceTint : state.faceTint);
 
     // The name shows the presenter during a presentation, otherwise this screen's own identity as
     // usual -- currentAgentName (for the wake word) deliberately ALWAYS stays this screen's own

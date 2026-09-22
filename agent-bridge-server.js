@@ -22,8 +22,15 @@ const path = require('path');
 const { startHub, fingerprintOfCertPem, loadPeerCert } = require('./agent-net.js');
 const { startHubBeacon } = require('./discovery.js');
 const { createSpeaker } = require('./speech.js');
-const { startOverlayServer, getLanIp, contentUrlPrefix, localizeContentUrl } = require('./overlay-server.js');
-const { extractFollowUpTag, buildTagHint, buildPeersLine, extractPresentationTag, splitSlideSegments, extractProvisionTag } = require('./followup-tag.js');
+const { startOverlayServer, getLanIp, normalizeScreen, readOwnContent, normalizePage, isWebsite, presentationLabel } = require('./overlay-server.js');
+const { extractFollowUpTag, buildSystemPointer, extractPresentationTag, splitSlideSegments, extractProvisionTag, extractIdentityTag } = require('./followup-tag.js');
+const agentHome = require('./agent-home.js');
+const { pickIdentity, normalizeTint } = require('./identity.js');
+const agentRegistry = require('./agent-registry.js');
+const permissionsLib = require('./permissions.js');
+const deviceConfirm = require('./device-confirm.js');
+const { startClaude, MESSAGE_MAX_CHARS, tooLongSentence } = require('./claude-cli.js');
+const updaterLib = require('./updater.js');
 const enrollmentLib = require('./enrollment.js');
 const inboxLib = require('./inbox.js');
 
@@ -45,11 +52,6 @@ const CLAUDE_EXE = (() => {
 // Ports/config file are overridable via environment variable, so a second instance can be
 // started in parallel for testing without disturbing the running one.
 const PORT = Number(process.env.AGENT_BRIDGE_PORT) || 8787;
-// This agent's own reachable base URL for self-generated presentation content
-// (presented_content/, see the buildTagHint calls below) -- computed once, never changes at runtime.
-// Includes the per-process content key (see serveContent in overlay-server.js) -- without it the
-// generated presentation would be refused, including to the machine meant to display it.
-const CONTENT_URL_PREFIX = contentUrlPrefix(`http://${getLanIp()}:${PORT}`);
 const SESSION_FILE = process.env.AGENT_SESSION_FILE || path.join(__dirname, '.session.json');
 
 // Loaded up here rather than only where the hub starts (bottom of the file): provisioning needs
@@ -105,7 +107,13 @@ const AGENT = {
   // Oscar's current actual appearance. Travels along during a presentation on an ANOTHER
   // screen (see presentFromOscar/playPresentationLocally below), so his own face appears there
   // instead of that screen's own.
-  faceStyle: 'kai'
+  faceStyle: 'kai',
+  // Pinned rather than derived. Every agent provisioned from now on gets its own generated
+  // palette (see identity.js), but the coordinator keeps the red it has always had -- the one
+  // face on the network nobody should have to re-learn. These are exactly kai's own colours
+  // written out, so the value is explicit instead of implied, and identity.js reserves this
+  // stretch of the colour wheel so no derived identity can land next to it.
+  faceTint: { idle: '#8a4a4a', thinking: '#ff6a3d', speaking: '#ff2b3d' }
 };
 
 const speaker = createSpeaker({
@@ -170,10 +178,31 @@ function rememberRouted(agentName, nodeName) {
 }
 
 // -- Agent network: remote nodes that connect here over an encrypted channel ---------
-// remoteAgents: agent name (spoken) -> { nodeName, domain }, e.g. "Nova" -> { nodeName:
-// "node2", domain: "Website, Cloudflare, ..." }. domain comes from the node itself when
-// connecting (its own net-config.json) and is used for sense-based routing below.
+// remoteAgents: agent name (spoken) -> { nodeName, domain, screen }, e.g. "Nova" -> { nodeName:
+// "node2", domain: "Website, Cloudflare, ..." }. Connected agents only. Name and domain come from
+// the hub's own record (agent-registry.js), never from what a node says about itself; domain is
+// what sense-based routing below decides by.
 const remoteAgents = new Map();
+const agentRecords = agentRegistry.createRegistry(NET_CONFIG_FILE);
+// nodeName -> the one decision about that machine waiting for the user, { id, kind, name, domain, reason }:
+//   kind 'introduction' -- a machine without a record, exactly as it introduced itself;
+//   kind 'request'      -- a recorded agent asking for its own name or responsibility to change
+//                          ([IDENTITY: ...], see receiveIdentityRequest).
+// Shown only to the user, never to an agent, and applied only by the user: /agent confirm|reject typed
+// at the console or on the hub's own page, or the buttons there (decideById). The id ties a click to
+// exactly the request it was shown for, so one replaced in the meantime is never accepted by accident.
+const pendingIdentity = new Map();
+// nodeName -> the pending entry last announced to the user, so a phone whose WiFi drops every few
+// minutes does not repeat the same notice on every reconnect.
+const announcedIntroductions = new Map();
+// nodeName -> an introduction the user declined, so it does not pop up again on every reconnect until
+// the machine introduces itself differently.
+const declinedIntroductions = new Map();
+// nodeName -> a decline the agent has not heard about yet, because it was offline when it happened.
+const queuedDeclines = new Map();
+// nodeName -> the machine's last hello, so a machine that could not be admitted (no free name) can
+// be admitted once the user gives it one, without having to reconnect.
+const lastHello = new Map();
 let hub = null;
 
 // -- Main display: which node (or Oscar himself) is currently showing presentations -----
@@ -202,6 +231,11 @@ const displayQueue = [];
 // requestId -> suggestedNext[], cached separately because the node currently serving as the main
 // display doesn't need to know the FORWARD suggestions from the original reply.
 const pendingPresentationSuggested = new Map();
+// requestId -> { agentName, displayNode } for every presentation handed to a node serving as the
+// main display. presentation-done names the presenter, and that name used to be believed from
+// whichever node sent it; now only the node the deck actually went to can finish it, and it
+// finishes it for the presenter recorded here.
+const presentationRelays = new Map();
 
 // Clears the currently shown presentation -- called EXCLUSIVELY once per genuinely new user
 // input (right at the top of askAgent()), NEVER from routeToAgent/advanceFollowUpQueue, so a
@@ -257,18 +291,91 @@ function gateForDisplay(targetKey, myRequestId, speakerInfo, deliver) {
 // hello/onPeerDown, so the list never stays stale for long. Since the main-display feature it
 // also carries WHO currently is the main display (or null), so every node locally knows
 // whether/whom it should even offer a presentation to.
+// What Oscar himself is responsible for, told to the other agents exactly like any node's domain.
+// It used to be an empty string here while the file-drop page had its own copy of the sentence --
+// so a node learned that "Oscar" exists but never what he is for, which is half of what a roster
+// is good for in the first place.
+const HUB_DOMAIN = 'Coordinator -- everything that has no clearer owner.';
+
 function peerListFor(excludeAgentName) {
-  const all = [{ name: AGENT.name, domain: '' }, ...Array.from(remoteAgents.entries()).map(([name, info]) => ({ name, domain: info.domain }))];
+  const all = [{ name: AGENT.name, domain: HUB_DOMAIN }, ...Array.from(remoteAgents.entries()).map(([name, info]) => ({ name, domain: info.domain }))];
   return all.filter((p) => p.name !== excludeAgentName);
 }
 
+// The main display as the rest of the network should see it: only while it can actually be reached.
+// One that is set but offline is reported as none, so every presenter falls back to its own screen
+// without first trying and failing (user's decision, 2026-09-15); its name travels separately, so
+// display.md can say why. Its screen class travels with it -- a presenter never learns more about
+// another agent's screen than that.
+function effectiveMainDisplay() {
+  if (!mainDisplayTarget) return { name: null, screen: null, offline: null };
+  if (!isReachable(mainDisplayTarget.agentName)) return { name: null, screen: null, offline: mainDisplayTarget.agentName };
+  const screen = mainDisplayTarget.nodeName === null
+    ? hubScreen
+    : ((remoteAgents.get(mainDisplayTarget.agentName) || {}).screen || null);
+  return { name: mainDisplayTarget.agentName, screen, offline: null };
+}
+
 function broadcastPeerLists() {
-  const mainDisplay = mainDisplayTarget ? mainDisplayTarget.agentName : null;
+  const md = effectiveMainDisplay();
   for (const [agentName, info] of remoteAgents) {
     if (hub && hub.isUp(info.nodeName)) {
-      hub.send(info.nodeName, { type: 'peers', list: peerListFor(agentName), mainDisplay });
+      // "you" tells a node who it is, and only once the hub has a record of it. A machine still
+      // waiting for the user keeps its own config, so the introduction the user is about to confirm
+      // is not replaced by the provisional name it was given in the meantime.
+      const you = agentRecords.get(info.nodeName) ? { name: agentName, domain: info.domain } : undefined;
+      hub.send(info.nodeName, { type: 'peers', list: peerListFor(agentName), you, mainDisplay: md.name, mainDisplayScreen: md.screen, mainDisplayOffline: md.offline });
     }
   }
+}
+
+function agentNameOfNode(nodeName) {
+  for (const [name, info] of remoteAgents) if (info.nodeName === nodeName) return name;
+  return null;
+}
+
+// Who already answers to this name, as words for the user -- or null when nodeName may have it.
+// Case-insensitive, because the voice and routing match names that way: to them "toby" and "Toby"
+// are the same agent.
+function nameHeldBy(name, nodeName) {
+  const lower = name.toLowerCase();
+  if (lower === AGENT.name.toLowerCase()) return "that is the hub's own name";
+  const recorded = agentRecords.nodeWithName(name, nodeName);
+  if (recorded) return `"${recorded}" has it`;
+  for (const [other, info] of remoteAgents) {
+    if (info.nodeName !== nodeName && other.toLowerCase() === lower) return `"${info.nodeName}" is using it right now`;
+  }
+  return null;
+}
+
+// Who a machine that just said hello is. The hub's record decides; the hello is only the machine's
+// introduction. A machine without a record -- every node enrolled before 2026-09-15 -- still joins,
+// so nothing stops working, but provisionally: under the name it gave if that is valid and free, and
+// with no responsibility, so its self-description reaches neither the other agents nor the routing
+// prompt until the user has accepted it.
+function admitIdentity(nodeName, hello) {
+  const introduced = { name: agentRegistry.cleanName(hello.agentName), domain: agentRegistry.cleanDomain(hello.domain) || '' };
+  const record = agentRecords.get(nodeName);
+  if (record) {
+    // A request the agent made stays waiting across a reconnect; only a leftover introduction goes.
+    const waiting = pendingIdentity.get(nodeName);
+    if (waiting && waiting.kind === 'introduction') clearPending(nodeName);
+    if (introduced.name && introduced.name !== record.name) {
+      console.log(`[network] "${nodeName}" introduced itself as "${introduced.name}" -- the hub's record says "${record.name}", and the record counts.`);
+    }
+    return { name: record.name, domain: record.domain, recorded: true };
+  }
+  // Kept under the same id while the introduction stays the same, so a card already on screen still
+  // works after the phone's WiFi dropped and came back.
+  const key = JSON.stringify(introduced);
+  const waiting = pendingIdentity.get(nodeName);
+  const alreadyWaiting = waiting && waiting.kind === 'introduction' && JSON.stringify({ name: waiting.name, domain: waiting.domain }) === key;
+  if (!alreadyWaiting && declinedIntroductions.get(nodeName) !== key) {
+    setPending(nodeName, { kind: 'introduction', name: introduced.name, domain: introduced.domain });
+  }
+  const fallback = nodeName.charAt(0).toUpperCase() + nodeName.slice(1);
+  const name = [introduced.name, fallback].find((n) => n && !nameHeldBy(n, nodeName));
+  return name ? { name, domain: '', recorded: false } : null;
 }
 
 // Fuzzy name comparison, so speech-recognition mishearings still match.
@@ -328,9 +435,7 @@ function isBroadcastRequest(userText) {
 // Extra Claude call, costs a few seconds of delay -- deliberately accepted for genuine
 // understanding of meaning instead of just keyword matching.
 function classifyRoute(userText, callback) {
-  // Deliberately separated with " | " instead of line breaks: the whole prompt ends up as ONE
-  // command-line argument, and real \n inside it has once already truncated the message (Windows
-  // splits arguments at such points) -- see the same rule for the other claude calls in this file.
+  // The prompt goes in on stdin (claude-cli.js) -- it quotes the user's words, which may be a long pasted text.
   const candidates = Array.from(remoteAgents.entries())
     .filter(([, info]) => hub && hub.isUp(info.nodeName) && info.domain)
     .map(([name, info]) => `${name}: ${info.domain}`)
@@ -338,8 +443,9 @@ function classifyRoute(userText, callback) {
   if (!candidates) { callback(null); return; }
 
   const prompt = `A user said: "${userText}". Available people in charge -- ${AGENT.name}: general assistant, for anything that doesn't clearly fall into another area. | ${candidates} -- Answer ONLY with the name of the best-matching person in charge, nothing else.`;
-  const args = ['-p', prompt, '--model', 'claude-haiku-4-5-20251001', '--output-format', 'json'];
-  const child = spawn(CLAUDE_EXE, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  const args = ['-p', '--model', 'claude-haiku-4-5-20251001', '--output-format', 'json'];
+  // ROUTER_DIR rather than this checkout -- see its definition. This runs on nearly every utterance.
+  const child = startClaude(CLAUDE_EXE, args, prompt, { cwd: ROUTER_DIR });
   currentClaudeChild = child;
 
   let out = '';
@@ -507,7 +613,7 @@ function advanceFollowUpQueue(myRequestId) {
   const priorPart = prior ? ` ${prior.answererName} said: "${prior.answerText}".` : '';
   // Deliberately NO instruction anymore to explicitly say "nothing to add" if nothing fits --
   // that was a leftover from before the marker mechanism, when it was the only way to signal the
-  // end of the chain. That is now handled entirely by the (invisible) marker in buildTagHint(),
+  // end of the chain. That is now handled entirely by the (invisible) FORWARD marker (network skill),
   // completely separate from the spoken text -- a forced verbal announcement now only feels unnatural.
   const followUpText = `The original question was: "${originalQuestion}".${priorPart} React briefly, whatever fits right now.`;
 
@@ -536,24 +642,117 @@ function advanceFollowUpQueue(myRequestId) {
   dispatch();
 }
 
+// Oscar's own home, outside this checkout -- see agent-home.js. He works IN it: running here in the
+// repository loaded the developer CLAUDE.md into every one of his turns, 4,487 tokens each,
+// measured. His skills are generated fresh on every start, including new-agent, which only the hub
+// can act on. Creating them also creates the home, which has to exist before it can be a cwd.
+const HOME = agentHome.agentHome(AGENT.name);
+const CONTENT_DIR_FOR_PROMPT = agentHome.slash(path.join(__dirname, 'presented_content'));
+const INBOX_DIR_FOR_PROMPT = agentHome.slash(path.join(__dirname, 'inbox'));
+// Oscar's own folder for files he creates -- see prepareHome in agent-home.js.
+const WORKSPACE_DIR = agentHome.slash(agentHome.workspaceDir(HOME));
+agentHome.prepareHome({
+  name: AGENT.name,
+  skills: ['network', 'presentation', 'inbox', 'workspace', 'sources', 'new-agent'],
+  vars: { INBOX_DIR: INBOX_DIR_FOR_PROMPT, WORKSPACE_DIR }
+});
+
+// An empty room for the routing classifier. It needs no skills and no files, only a working
+// directory outside this repository -- otherwise every routing decision, made on almost every
+// utterance without a name in it, would pay for the developer CLAUDE.md as well.
+const ROUTER_DIR = path.join(agentHome.HOME_ROOT, '.router');
+fs.mkdirSync(ROUTER_DIR, { recursive: true });
+
+// Keeps the two skill data files current. Called when a node joins or leaves, when the main display
+// changes, and once before each of Oscar's turns; both writes are no-ops when nothing changed.
+// remoteAgents only ever holds connected agents (a disconnect removes the entry), so no liveness
+// check is needed here.
+function refreshSkillData() {
+  const peers = Array.from(remoteAgents.entries()).map(([name, info]) => ({ name, domain: info.domain }));
+  agentHome.writeRoster(HOME, AGENT.name, peers, HUB_DOMAIN);
+  const md = effectiveMainDisplay();
+  agentHome.writeDisplay(HOME, {
+    selfName: AGENT.name,
+    mainDisplay: md.name,
+    offlineMainDisplay: md.offline,
+    // Oscar's decks land on his own screen unless a reachable node is the main display.
+    screen: md.name && md.name !== AGENT.name ? md.screen : hubScreen,
+    contentDir: CONTENT_DIR_FOR_PROMPT
+  });
+}
+
+// Same reasoning as loadSessionId in node-agent.js: Claude Code files a session under the directory
+// it ran in, so a session saved while Oscar still worked in the repository cannot be resumed from
+// his home. Files from before this field existed belong to the repository.
 function loadSessionId() {
-  try { return JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8')).sessionId || null; }
-  catch (e) { return null; }
+  try {
+    const saved = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8').replace(/^﻿/, ''));
+    const savedCwd = saved.cwd || __dirname;
+    if (path.resolve(savedCwd) !== path.resolve(HOME)) {
+      console.log(`[${AGENT.name}] Starting a new conversation: the saved one belongs to ${savedCwd}, ${AGENT.name} now works in ${HOME}.`);
+      return null;
+    }
+    return saved.sessionId || null;
+  } catch (e) { return null; }
 }
 function saveSessionId(id) {
-  try { fs.writeFileSync(SESSION_FILE, JSON.stringify({ sessionId: id })); } catch (e) {}
+  try { fs.writeFileSync(SESSION_FILE, JSON.stringify({ sessionId: id, cwd: HOME })); } catch (e) {}
 }
 let sessionId = loadSessionId();
+// The other agents' names as of Oscar's previous turn, so he can be told once, as an event, who
+// joined or left in between. null until his first turn in this process.
+let rosterAtLastTurn = null;
+// The class of the screen Oscar's own face page is shown on, or null (see onScreenChange below).
+let hubScreen = null;
+refreshSkillData();
+
+// This PC's own confirmation dialog (device-confirm.js): the only thing that lets a change to Oscar's
+// permissions, a decision card or a typed /agent through. It states the change in its own words, so what
+// an agent does to the face page cannot change what the user agrees to.
+const confirmer = deviceConfirm.createConfirmer();
+// What Oscar may do: set on this machine's face page only, and confirmed with the dialog above
+// (permissions.js). The AGENT fields above are just what a fresh machine starts with.
+const permissionStore = permissionsLib.createPermissionStore({
+  id: AGENT.name.toLowerCase(), role: 'hub', agentName: AGENT.name,
+  seed: permissionsLib.seedFromConfig({ role: 'hub', allowedTools: AGENT.allowedTools, chrome: AGENT.chrome, mcpConfig: AGENT.mcpConfig, permissionMode: AGENT.permissionMode }),
+  available: { mcp: !!AGENT.mcpConfig },
+  confirmer
+});
+// Runs once the check is done, long after the overlay below exists.
+confirmer.ready.then(() => overlay.pushPage({ type: 'permissions', status: permissionStore.status() }));
+
+// Oscar's own program, kept up to date by itself (updater.js) -- the other agents look after their own,
+// whatever code they run. Idle means no turn running for anyone and no presentation on screen.
+const updater = updaterLib.createUpdater({
+  root: __dirname, agentName: AGENT.name, confirmer,
+  isIdle: () => busyTargets.size === 0 && !currentPresentation && !currentClaudeChild,
+  onChange: (update) => overlay.pushPage({ type: 'update', update })
+});
+updater.start();
 
 const overlay = startOverlayServer({
   port: PORT,
   // ONLY Oscar's overlay passes input through. targetAgent is set when it came from a per-agent
   // chat box on the stage page; the microphone leaves it null and routing works as it always has.
-  onUserInput: (text, targetAgent) => askAgent(text, targetAgent),
+  // Oscar's own screen class, from a browser showing his face page on this machine. Changes when a
+  // page opens or closes, not when a window is resized or a device turned.
+  onScreenChange: (screen) => {
+    hubScreen = screen;
+    refreshSkillData();
+    broadcastPeerLists(); // only changes what nodes see while Oscar himself is the main display
+  },
+  onUserInput: (text, targetAgent, source) => askAgent(text, targetAgent, source),
+  // Decisions only the user makes (see pendingIdentity): the list behind the buttons on this machine's
+  // own page, and a click on one of them. The face server accepts both only from that page.
+  getDecisions: () => pendingDecisions(),
+  onDecision: (id, accept, reply) => decideById(id, accept, reply),
+  onPageMessage: (msg, reply) => (updaterLib.PAGE_MESSAGE_TYPES.includes(msg.type)
+    ? updater.handlePageMessage(msg, reply)
+    : permissionsLib.handlePageMessage(permissionStore, msg, reply, (obj) => overlay.pushPage(obj))),
   // Powers the file-drop page at /files. Hub-only -- a node knows neither the roster nor how to
   // route a file to somebody else.
   getAgents: () => [
-    { name: AGENT.name, domain: 'Coordinator — everything that has no clearer owner.', online: true },
+    { name: AGENT.name, domain: HUB_DOMAIN, online: true },
     ...Array.from(remoteAgents.entries()).map(([name, info]) => ({
       name, domain: info.domain || '', online: !!(hub && hub.isUp(info.nodeName))
     }))
@@ -584,8 +783,13 @@ function setOverlayState(partial) {
   // live: Oscar's screen also showed foreign presentations, ownDisplayHidden only hides his
   // FACE, not the iframe). Oscar's OWN screen may only show something when HE HIMSELF is
   // actually the main-display node.
-  const ownScreenPresentation = (mainDisplayTarget && mainDisplayTarget.nodeName === null) ? currentPresentation : null;
-  overlay.setState(Object.assign({}, partial, { agentNames: [AGENT.name, ...remoteAgents.keys()], presentation: ownScreenPresentation, faceStyle: AGENT.faceStyle }));
+  //
+  // Since 2026-09-15 Oscar's own screen also shows his decks when there is no reachable main display,
+  // so "is Oscar the main display" stopped being the right test -- with none set, his deck played
+  // with sound but never appeared (found live the same day). What is right: was this presentation
+  // put on HIS screen. Only playPresentationLocally ever does that, and it marks the object so.
+  const ownScreenPresentation = currentPresentation && currentPresentation.onOwnScreen ? currentPresentation : null;
+  overlay.setState(Object.assign({}, partial, { faceTint: AGENT.faceTint, agentNames: [AGENT.name, ...remoteAgents.keys()], presentation: ownScreenPresentation, faceStyle: AGENT.faceStyle }));
 }
 setOverlayState({ status: 'idle', text: '', agent: AGENT.name });
 
@@ -614,7 +818,7 @@ function say(text, myRequestId, speakerName = AGENT.name, allowFollowUp = true, 
       };
       // Only relevant when Oscar himself is currently the main display AND something else is
       // already running -- gateForDisplay() delivers immediately if neither applies.
-      gateForDisplay(HUB_TARGET, myRequestId, { agentName: AGENT.name, faceStyle: AGENT.faceStyle }, deliver);
+      gateForDisplay(HUB_TARGET, myRequestId, { agentName: AGENT.name, faceStyle: AGENT.faceStyle, faceTint: AGENT.faceTint }, deliver);
     } else {
       setOverlayState({ status: 'speaking', text, agent: speakerName, needsBrowserSpeech: true });
       // Without Piper there is no reliable "done speaking" point -- the follow-up chain stops here.
@@ -640,15 +844,28 @@ function routeToAgent(target, userText, myRequestId) {
 // he himself is the presenter (presentFromOscar, no network hop needed) or a remote agent
 // sends him something to display (the present-request handler further below). Mirrors the
 // 'present' handler in node-agent.js, just without the detour through hub.send/link.send.
-// Reads the audio out of a 'present'/'present-request' message. Accepts BOTH the current shape
-// (segments[]) and the older single-blob audioBase64 -- deliberately, so a machine still running
-// an outdated copy of the project degrades to a working single-slide presentation instead of
-// having its message silently ignored by the guard. Mirrored in node-agent.js.
-// Returns null if there is no usable audio at all.
+// Reads the slides out of a 'present'/'present-request' message. Two kinds of segment can arrive:
+//   { audioBase64, text }   the presenter's own recorded voice -- what a Windows or Linux agent sends
+//   { text, speakText }     text only -- what a phone sends, because its TTS engine cannot record to
+//                           a file; the display speaks it in its own voice (added 2026-09-14)
+// All segments must be usable, or narration and slides would drift apart, so one bad segment
+// rejects the list. The older single-blob audioBase64 is still accepted, so a machine running an
+// outdated copy degrades to a one-slide presentation instead of being ignored. Returns null if
+// nothing usable arrived. Mirrored in node-agent.js.
 function normalizePresentSegments(msg) {
   if (Array.isArray(msg.segments) && msg.segments.length) {
-    const usable = msg.segments.filter((s) => s && typeof s.audioBase64 === 'string');
-    if (usable.length) return usable.map((s) => ({ audioBase64: s.audioBase64, text: typeof s.text === 'string' ? s.text : '' }));
+    const out = [];
+    for (const s of msg.segments) {
+      if (s && typeof s.audioBase64 === 'string') {
+        out.push({ audioBase64: s.audioBase64, text: typeof s.text === 'string' ? s.text : '' });
+      } else if (s && s.speakText === true && typeof s.text === 'string' && s.text.trim()) {
+        out.push({ text: s.text, speakText: true });
+      } else {
+        out.length = 0;
+        break;
+      }
+    }
+    if (out.length) return out;
   }
   if (typeof msg.audioBase64 === 'string') {
     return [{ audioBase64: msg.audioBase64, text: typeof msg.text === 'string' ? msg.text : '' }];
@@ -656,29 +873,53 @@ function normalizePresentSegments(msg) {
   return null;
 }
 
-// Writes each segment's audio to its own file under audio_out/. Returns null (having cleaned up
-// whatever was already written) if any of them fails, so callers get an all-or-nothing result.
-function writeSegmentFiles(wireSegments) {
-  const written = [];
-  try {
-    wireSegments.forEach((s, i) => {
-      const filePath = path.join(__dirname, 'audio_out', `present-${Date.now()}-${i}.wav`);
-      fs.writeFileSync(filePath, Buffer.from(s.audioBase64, 'base64'));
-      written.push({ filePath, text: s.text });
+// Turns those segments into files this machine can play, one per slide, and calls back with
+// [{ filePath, text }] -- or with null, having removed anything already written, so the caller
+// gets all or nothing. Audio is written as it came, unless this machine cannot play audio files:
+// then the slide text is spoken by the local engine instead, which keeps the presentation
+// narrated and in step, just not in the presenter's own voice. Mirrored in node-agent.js.
+let presentFileSeq = 0;
+function prepareSegmentFiles(wireSegments, callback) {
+  const prepared = [];
+  const canPlayAudio = speaker.canPlayAudioFiles();
+  const fail = (why) => {
+    console.error(`[maindisplay] ${why}`);
+    for (const s of prepared) fs.unlink(s.filePath, () => {});
+    callback(null);
+  };
+  const next = (i) => {
+    if (i >= wireSegments.length) { callback(prepared); return; }
+    const s = wireSegments[i];
+    if (s.audioBase64 && canPlayAudio) {
+      const filePath = path.join(__dirname, 'audio_out', `present-${Date.now()}-${++presentFileSeq}.wav`);
+      try {
+        fs.writeFileSync(filePath, Buffer.from(s.audioBase64, 'base64'));
+      } catch (e) {
+        fail(`Could not write audio data: ${e.message}`);
+        return;
+      }
+      prepared.push({ filePath, text: s.text });
+      next(i + 1);
+      return;
+    }
+    if (!s.text) { fail('A slide arrived with audio this machine cannot play and no text to speak instead.'); return; }
+    speaker.synthesizeSpeech(s.text, (filePath) => {
+      if (!filePath) { fail('Could not turn a slide into speech.'); return; }
+      prepared.push({ filePath, text: s.text });
+      next(i + 1);
     });
-    return written;
-  } catch (e) {
-    console.error('[maindisplay] Could not write audio data:', e.message);
-    for (const s of written) fs.unlink(s.filePath, () => {});
-    return null;
-  }
+  };
+  next(0);
 }
 
 // segments: [{ filePath, text }] -- one entry per slide. A single-slide presentation is just the
 // one-element case, so there is no separate code path for it.
-function playPresentationLocally(segments, agentName, url, text, presoRequestId, suggestedNext, faceStyle) {
+// page: { name, html } when the presentation is an agent's own page (see readOwnContent in
+// overlay-server.js) -- shown from memory under a fresh local link. Without one, url is a real website.
+function playPresentationLocally(segments, agentName, url, text, presoRequestId, suggestedNext, faceStyle, faceTint, page) {
   const deliver = () => {
-    currentPresentation = { agentName, url, faceStyle, slide: 0 };
+    const shownUrl = (page && overlay.showPage(page)) || url;
+    currentPresentation = { agentName, url: shownUrl, faceStyle, faceTint: normalizeTint(faceTint), slide: 0, onOwnScreen: true };
     presentationOwnerRequestId = presoRequestId;
     setOverlayState({ status: 'speaking', text: segments[0].text, agent: AGENT.name });
     speaker.playSequence(segments.map((s) => s.filePath), (index) => {
@@ -726,6 +967,14 @@ function playPresentationLocally(segments, agentName, url, text, presoRequestId,
 // presentation is the one-element case, no separate path.
 function presentFromOscar(slideTexts, myRequestId, url, suggestedNext) {
   const text = slideTexts.join(' ');
+  // Oscar's own page travels as the page itself, wherever it is shown -- never as the key-carrying
+  // link he wrote (see readOwnContent in overlay-server.js).
+  const page = readOwnContent(url);
+  if (!page && !isWebsite(url)) {
+    console.error(`[maindisplay] Nothing to show for "${presentationLabel(url)}" -- no such page, too big, or not a website address. Speaking without it.`);
+    say(text, myRequestId, AGENT.name, true, suggestedNext);
+    return;
+  }
   speaker.synthesizeAll(slideTexts, (filePaths) => {
     if (myRequestId !== activeRequestByTarget.get(HUB_TARGET)) {
       if (filePaths) for (const f of filePaths) fs.unlink(f, () => {});
@@ -744,14 +993,11 @@ function presentFromOscar(slideTexts, myRequestId, url, suggestedNext) {
     // make the .nodeName read below a TypeError that takes the whole hub down. Always a latent
     // risk, but a real one since a multi-slide deck synthesizes N segments instead of one and the
     // window is now seconds rather than a moment.
-    if (!mainDisplayTarget) {
-      console.log('[maindisplay] Main display went away during synthesis -- speaking normally.');
-      for (const s of segments) fs.unlink(s.filePath, () => {});
-      say(text, myRequestId, AGENT.name, true, suggestedNext);
-      return;
-    }
-    if (mainDisplayTarget.nodeName === null) {
-      playPresentationLocally(segments, AGENT.name, url, text, myRequestId, suggestedNext, AGENT.faceStyle);
+    // No main display (never set, switched off, or gone during synthesis), one that cannot be reached
+    // right now, and Oscar being the main display himself all end up in the same place: his own
+    // screen (user's decision, 2026-09-15).
+    if (!mainDisplayTarget || mainDisplayTarget.nodeName === null || !isReachable(mainDisplayTarget.agentName)) {
+      playPresentationLocally(segments, AGENT.name, url, text, myRequestId, suggestedNext, AGENT.faceStyle, AGENT.faceTint, page);
       return;
     }
     // ownDisplayHidden: Oscar's own overlay hides completely (not just idle) while the reply
@@ -760,34 +1006,46 @@ function presentFromOscar(slideTexts, myRequestId, url, suggestedNext) {
     setOverlayState({ status: 'idle', text: '', agent: AGENT.name, ownDisplayHidden: true });
     let wireSegments;
     try {
-      wireSegments = segments.map((s) => ({ audioBase64: fs.readFileSync(s.filePath).toString('base64'), text: s.text }));
+      // A phone has no recording to send -- its synthesis only parks text for its own TTS engine --
+      // so it sends the slide texts, and the display speaks them (see normalizePresentSegments).
+      wireSegments = speaker.producesAudioFiles()
+        ? segments.map((s) => ({ audioBase64: fs.readFileSync(s.filePath).toString('base64'), text: s.text }))
+        : segments.map((s) => ({ text: s.text, speakText: true }));
     } catch (e) {
       console.error('[maindisplay] Audio file unreadable, speaking normally instead:', e.message);
       say(text, myRequestId, AGENT.name, true, suggestedNext);
       return;
     }
-    for (const s of segments) fs.unlink(s.filePath, () => {});
+    // The local files are kept until the deck is actually on its way: if sending fails, they are
+    // what lets Oscar still show it on his own screen instead of only speaking it.
     const deliver = () => {
       try {
         pendingPresentationSuggested.set(myRequestId, suggestedNext);
+        presentationRelays.set(myRequestId, { agentName: AGENT.name, displayNode: mainDisplayTarget.nodeName });
         presentationOwnerRequestId = myRequestId;
-        currentPresentation = { agentName: AGENT.name, url, faceStyle: AGENT.faceStyle, slide: 0 };
+        currentPresentation = { agentName: AGENT.name, url, faceStyle: AGENT.faceStyle, faceTint: AGENT.faceTint, slide: 0 };
         // audioBase64 is only set for the single-slide case: it costs nothing there (same string,
         // one segment) and keeps a node running an older copy of the project working, since that
         // is the shape it expects. A multi-slide deck genuinely needs the new node code anyway,
         // so duplicating the first segment's audio into it would just inflate the message.
         hub.send(mainDisplayTarget.nodeName, {
-          type: 'present', requestId: myRequestId, agentName: AGENT.name, url, text, faceStyle: AGENT.faceStyle,
+          // The page itself, never the key-carrying link (see readOwnContent); url stays for websites.
+          type: 'present', requestId: myRequestId, agentName: AGENT.name, url: page ? '' : url, page: page || undefined, text, faceStyle: AGENT.faceStyle, faceTint: AGENT.faceTint,
           segments: wireSegments,
           audioBase64: wireSegments.length === 1 ? wireSegments[0].audioBase64 : undefined
         });
-        console.log(`[maindisplay] Oscar is presenting on "${mainDisplayTarget.agentName}"${wireSegments.length > 1 ? ` (${wireSegments.length} slides)` : ''}: ${url}`);
+        console.log(`[maindisplay] Oscar is presenting on "${mainDisplayTarget.agentName}"${wireSegments.length > 1 ? ` (${wireSegments.length} slides)` : ''}: ${presentationLabel(url)}`);
+        for (const s of segments) fs.unlink(s.filePath, () => {});
       } catch (e) {
-        // e.g. MAX_MSG_BYTES exceeded or the connection just dropped -- avoid crashing (see
-        // agent-net.js), fall back to speaking normally instead of letting the reply silently vanish.
-        console.error('[maindisplay] Could not send own presentation, speaking normally instead:', e.message);
+        // e.g. MAX_MSG_BYTES exceeded, the connection just dropped, or the display went away while
+        // this waited in the queue -- avoid crashing (see agent-net.js) and show the deck on Oscar's
+        // own screen instead of letting it vanish.
+        console.error('[maindisplay] Could not send own presentation, showing it on his own screen instead:', e.message);
         pendingPresentationSuggested.delete(myRequestId);
-        say(text, myRequestId, AGENT.name, true, suggestedNext);
+        presentationRelays.delete(myRequestId);
+        currentPresentation = null;
+        presentationOwnerRequestId = null;
+        playPresentationLocally(segments, AGENT.name, url, text, myRequestId, suggestedNext, AGENT.faceStyle, AGENT.faceTint, page);
       }
     };
     // If the target screen currently shows a DIFFERENT chain, wait instead of overwriting it.
@@ -807,6 +1065,7 @@ function presentFromOscar(slideTexts, myRequestId, url, suggestedNext) {
 // a slide deck is meant to be seen, a file someone handed to one agent is not.
 function deliverFile(agentName, fileName, buffer) {
   if (agentName === AGENT.name) {
+    if (!permissionStore.effective().files) return { ok: false, error: 'Oscar does not accept files (switched off in his permissions)' };
     const dir = inboxLib.ensureInbox(__dirname);
     const target = path.join(dir, inboxLib.safeName(fileName));
     // uniquePath lives in inbox.js for the receive path; here the same rule is applied by letting
@@ -848,6 +1107,12 @@ function speakableCode(code) {
 // Everything the new machine needs to run, assembled from what Oscar collected plus what only the
 // hub knows (its own name, its LAN address, the ports).
 function buildNodeConfig(name, wanted) {
+  // Derived against everyone already on the network, not from the name alone: a per-name function
+  // cannot see the other agents, so it cannot avoid them, and two of eight collided outright in
+  // testing. Oscar is in the list even though he wears his own pinned red -- reserving a slot he
+  // does not use costs one of seventeen hues and keeps the rule "every known agent is accounted
+  // for" simple enough to stay true.
+  const identity = pickIdentity(name, [AGENT.name.toLowerCase(), ...Array.from(remoteAgents.keys()).map((n) => n.toLowerCase())]);
   const cfg = {
     _comment: `Generated by ${AGENT.name} during enrollment on ${new Date().toISOString().slice(0, 10)}.`,
     self: name,
@@ -856,11 +1121,18 @@ function buildNodeConfig(name, wanted) {
     hubHost: getLanIp(),
     hubPort: NET_PORT,
     agentName: wanted.agentName || (name.charAt(0).toUpperCase() + name.slice(1)),
-    piperVoice: wanted.piperVoice || 'en_US-ljspeech-high.onnx',
+    piperVoice: wanted.piperVoice || identity.piperVoice,
     overlayPort: 8787,
     domain: wanted.domain || '',
     personality: wanted.personality || 'Direct and pragmatic, answering in 1-3 short, chat-style sentences.',
-    faceStyle: wanted.faceStyle || 'ava',
+    faceStyle: wanted.faceStyle || identity.faceStyle,
+    // A colour of its own, and a voice of its own. Before this, every new agent was handed the
+    // same two defaults, so the third machine to join the network turned up wearing the second
+    // one's face and speaking in its voice -- nothing was broken, they simply could not be told
+    // apart. normalizeTint guards the deliberate value for the same reason it guards everything
+    // else on this path: a tint ends up inside a stylesheet in the overlay's privileged document.
+    faceTint: normalizeTint(wanted.faceTint) || identity.faceTint,
+    androidTts: wanted.androidTts || identity.androidTts,
     mainDisplay: false
   };
   // Only carried over when explicitly asked for -- these widen what the new agent may do, so they
@@ -902,6 +1174,23 @@ function startProvisioning(wanted) {
   if (fs.existsSync(path.join(__dirname, 'certs', `${name}-cert.pem`))) {
     return { error: `An agent called "${name}" already exists on this network. Pick a different name.` };
   }
+  // The spoken name and the responsibility become the hub's record the moment the machine joins (see
+  // onEnrolled), so they meet the same rules as /agent here -- before a code is read out, not after
+  // the new machine is already paired.
+  const spokenName = (wanted.agentName === undefined || wanted.agentName === '')
+    ? name.charAt(0).toUpperCase() + name.slice(1)
+    : agentRegistry.cleanName(wanted.agentName);
+  if (!spokenName) {
+    return { error: `I can't use "${wanted.agentName}" as its spoken name. It has to start with a letter and use only letters, digits, spaces or dashes.` };
+  }
+  if (nameHeldBy(spokenName, name)) {
+    return { error: `The name ${spokenName} is already taken on this network. Pick a different one.` };
+  }
+  const domain = agentRegistry.cleanDomain(typeof wanted.domain === 'string' ? wanted.domain : '');
+  if (domain === null) {
+    return { error: 'That description of what it is for is too long. One sentence is enough.' };
+  }
+  const settled = Object.assign({}, wanted, { agentName: spokenName, domain });
   const code = enrollmentLib.generateCode();
   try {
     enrollment = enrollmentLib.startEnrollmentListener({
@@ -910,9 +1199,18 @@ function startProvisioning(wanted) {
       port: ENROLL_PORT,
       code,
       expectedName: name,
-      buildConfig: (n) => buildNodeConfig(n, wanted),
+      buildConfig: (n) => buildNodeConfig(n, settled),
       onEnrolled: (n) => {
         persistPeer(n);
+        // Recorded here, with the peer, rather than at first contact: this is where the user's own
+        // decision -- the name and purpose they gave, confirmed by typing the pairing code on the new
+        // machine -- is final. Failing to write it is no reason to fail the pairing; the machine then
+        // introduces itself and waits for /agent confirm, like one enrolled before records existed.
+        try {
+          agentRecords.set(n, { name: settled.agentName, domain: settled.domain });
+        } catch (e) {
+          console.error(`[enroll] could not record the name and responsibility of "${n}":`, e.message);
+        }
         if (hub) hub.addPeer(n);
       },
       onClosed: () => { enrollment = null; }
@@ -935,6 +1233,23 @@ function startProvisioning(wanted) {
 // config edit, no restart). Permanently overrides an automatic hello assignment
 // (mainDisplaySetManually), so a reconnecting node with "mainDisplay":true in its config doesn't
 // accidentally undo this deliberate decision.
+// "/maindisplay off": no main display at all, so every agent presents on its own screen again.
+// Recorded as a manual decision, just like naming one -- otherwise the next node with
+// "mainDisplay": true in its config would quietly take the role back on its next connect.
+function clearMainDisplay() {
+  const oldTarget = mainDisplayTarget;
+  mainDisplayTarget = null;
+  mainDisplaySetManually = true;
+  if (oldTarget && oldTarget.nodeName !== null && hub && hub.isUp(oldTarget.nodeName)) {
+    try { hub.send(oldTarget.nodeName, { type: 'clear-presentation' }); } catch (e) {}
+  }
+  currentPresentation = null;
+  presentationOwnerRequestId = null;
+  console.log('No main display any more -- every agent presents on its own screen.');
+  broadcastPeerLists();
+  refreshSkillData();
+}
+
 function setMainDisplay(rawName) {
   const resolved = resolveKnownName(rawName);
   if (!resolved) {
@@ -958,19 +1273,9 @@ function setMainDisplay(rawName) {
   presentationOwnerRequestId = null;
   console.log(`Main display is now "${resolved}".`);
   broadcastPeerLists();
+  refreshSkillData();
 }
 
-function currentPeersLine() {
-  return buildPeersLine(Array.from(remoteAgents.entries()).map(([name, info]) => ({ name, domain: info.domain })));
-}
-
-// Unlike the marker hint (a behavioral instruction that has to be repeated every turn), the peer
-// list is a plain fact -- only append it again when the network has actually changed since the
-// last turn (see onPeerDown/hello below) or on /reset, not blindly repeated on every single
-// reply. Starts at true, so the very first turn is guaranteed to get it. Same principle as
-// peersDirty in node-agent.js, but without the race-condition risk here -- Oscar knows
-// remoteAgents synchronously/locally, no network message needed.
-let oscarPeersDirty = true;
 
 // Oscar answers himself.
 function askOscarDirectly(userText, myRequestId) {
@@ -984,69 +1289,43 @@ function askOscarDirectly(userText, myRequestId) {
   busyTargets.add(HUB_TARGET);
   setOverlayState({ status: 'thinking', text: '', agent: AGENT.name });
 
-  const peersLine = oscarPeersDirty ? currentPeersLine() : '';
-  oscarPeersDirty = false;
-  // Read fresh on every turn (no dirty flag needed like for peersLine -- this is just a cheap
-  // bool read, Oscar knows mainDisplayTarget synchronously/locally).
-  const hasMainDisplay = mainDisplayTarget !== null;
-  const tagHint = buildTagHint(hasMainDisplay, CONTENT_URL_PREFIX);
+  refreshSkillData();
 
-  // Rebuilt from the folder every turn (not from a pending list), so files the agent moved or
-  // deleted last turn simply stop being mentioned. Goes into the MESSAGE, not the system prompt:
-  // it is a fact about right now, like peersLine -- not a standing behavioural rule.
-  const inboxFiles = inboxLib.listInbox(__dirname);
-  const inboxLine = inboxLib.buildInboxLine(inboxFiles, newInboxFiles);
+  // Only events go into the message: who joined or left since Oscar's last turn, and files that
+  // just arrived. Standing facts live in his skills and their data files -- agent-skills/README.md.
+  const rosterNow = Array.from(remoteAgents.keys());
+  const rosterEvent = agentHome.describeRosterChange(rosterAtLastTurn, rosterNow);
+  rosterAtLastTurn = rosterNow;
+  const inboxEvent = inboxLib.buildInboxEvent(inboxLib.listInbox(__dirname), newInboxFiles);
   newInboxFiles.clear();
+  const events = `${rosterEvent} ${inboxEvent}`.trim();
 
+  // The message goes in on stdin (claude-cli.js): no length limit, and line breaks survive. On the command
+  // line a long pasted text ended Nova's whole process, and a line break once truncated a message.
+  const prompt = sessionId
+    ? [userText, events].filter(Boolean).join('\n\n')
+    : [`You are ${AGENT.name}, the central coordinator of a network of AI assistant colleagues. ${AGENT.personality}`, events, `Message: ${userText}`].filter(Boolean).join('\n\n');
   const args = ['-p'];
-  if (sessionId) {
-    args.push(`${userText} ${peersLine} ${inboxLine}`.replace(/\s+/g, ' ').trim(), '--resume', sessionId);
-  } else {
-    // No embedded \n here: Windows splits command-line arguments at real line breaks, which
-    // previously truncated the message and broke the JSON output.
-    const persona = `You are ${AGENT.name}, the central coordinator of a network of AI assistant colleagues. ${peersLine} ${AGENT.personality} ${inboxLine} Message: ${userText}`
-      .replace(/\s+/g, ' ').trim();
-    args.push(persona);
-  }
-  // tagHint goes via --append-system-prompt, no longer embedded in the message: observed live
-  // (2026-08-17, see node-agent.js for the full derivation) that a forceful action instruction
-  // sitting inside the "user" message got flagged by the model as a possible prompt-injection
-  // attempt and was deliberately ignored. Still included on EVERY turn regardless (a behavioral
-  // instruction, not a one-time fact).
-  args.push('--append-system-prompt', tagHint);
+  if (sessionId) args.push('--resume', sessionId);
+  // Only a pointer to the skills, through --append-system-prompt rather than the message -- see
+  // buildSystemPointer for why. Identical on every turn, so it no longer breaks the prompt cache.
+  args.push('--append-system-prompt', buildSystemPointer({ agentName: AGENT.name, canProvision: true }));
   args.push('--output-format', 'json');
   if (AGENT.effort) args.push('--effort', AGENT.effort);
-  // Every agent automatically gets write access to EXACTLY its own presented_content/ folder
-  // (main-display feature, user's wish 2026-08-17: "every agent should at least have a folder it
-  // can work in") -- via Edit(...), not Write(...): empirically confirmed that the CLI accepts
-  // Write(path) rules but never actually enforces them (only Edit(path) is really checked, which
-  // covers Write too). ALWAYS appended, independent of AGENT.allowedTools, not instead of it --
-  // this also applies to Oscar, who deliberately has no write access otherwise, but scoped
-  // narrowly enough (verified: writing outside the folder remains refused).
-  // "Skill" is in the same always-appended group: without it the project's own skills (see
-  // .claude/skills/, e.g. the multi-slide "presentation" one) are discovered but cannot actually
-  // be invoked once --allowedTools narrows the set. Costs nothing when no skill fits -- the model
-  // only pulls one in when it decides the situation calls for it.
-  // Edit(inbox/**) so an agent can act on what it was handed -- move, rename, tidy up -- not just
-  // read it. Read access needs no grant (verified live: a restricted agent describes a dropped
-  // image correctly), so this is only about writing.
-  const baseTools = 'Edit(presented_content/**),Edit(inbox/**),Skill';
-  const allowedTools = AGENT.allowedTools ? `${AGENT.allowedTools},${baseTools}` : baseTools;
-  args.push('--allowedTools', allowedTools);
-  if (AGENT.mcpConfig) args.push('--mcp-config', AGENT.mcpConfig);
-  if (AGENT.permissionMode) args.push('--permission-mode', AGENT.permissionMode);
-  // Security gap empirically found and closed 2026-08-17: without ANY flag at all, the CLI in
-  // headless mode (-p) lets the "PowerShell" tool (on Windows the only shell execution tool --
-  // there is no separate "Bash" here at all) through WITHOUT asking, while Write/Edit correctly
-  // stay blocked -- verified with real marker text and the full tool-call log, not a
-  // misunderstanding. --allowedTools with other values changes NOTHING about this (also
-  // verified) -- only an explicit --disallowedTools closes the gap. Only applies when NO
-  // permissionMode is set -- a deliberately broader level (like Nova's bypassPermissions)
-  // should not be restricted by this.
-  if (!AGENT.permissionMode) args.push('--disallowedTools', 'PowerShell');
-  if (AGENT.chrome) args.push('--chrome');
+  // What Oscar may do comes only from his verified permissions (permissions.js), set and confirmed on
+  // this machine's face page. The measured facts behind every switch -- Edit rules, Skill, the shell
+  // being blocked by name -- are recorded next to claudePermissionArgs. Read access needs no grant
+  // (verified live: a restricted agent describes a dropped image correctly).
+  const turnPermissions = permissionStore.effective();
+  args.push(...permissionsLib.claudePermissionArgs(turnPermissions, {
+    contentDir: CONTENT_DIR_FOR_PROMPT, inboxDir: INBOX_DIR_FOR_PROMPT, workspaceDir: WORKSPACE_DIR,
+    projectDir: null, extraTools: permissionsLib.extraToolsFrom(AGENT.allowedTools), mcpConfig: AGENT.mcpConfig
+  }));
 
-  const child = spawn(CLAUDE_EXE, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  // This checkout, for writing presentations and handling inbox files. An --add-dir does not load
+  // its CLAUDE.md (measured), so the developer docs stay out of Oscar's context.
+  args.push('--add-dir', __dirname);
+  const child = startClaude(CLAUDE_EXE, args, prompt, { cwd: HOME });
   currentClaudeChild = child;
 
   let out = '';
@@ -1093,16 +1372,21 @@ function askOscarDirectly(userText, myRequestId) {
     // The presentation marker is extracted FIRST (it's the outermost one, see followup-tag.js),
     // FORWARD only afterward on the rest -- so Oscar can combine both in a single reply.
     const { cleanText: afterPresentation, presentationUrl: rawPresentationUrl } = extractPresentationTag(text);
-    // Rebuilt from the CURRENT base whenever it points at one of our own files -- an agent's
-    // session history is full of older base URLs and it reproduces those, address and all.
-    const presentationUrl = rawPresentationUrl ? localizeContentUrl(rawPresentationUrl, `http://${getLanIp()}:${PORT}`) : rawPresentationUrl;
-    if (rawPresentationUrl && presentationUrl !== rawPresentationUrl) {
-      console.log(`[maindisplay] corrected a stale content URL: ${rawPresentationUrl}`);
-    }
+    // The file name of one of Oscar's own pages, or a website's address -- see ownPageName and isWebsite
+    // in overlay-server.js. An old-style link from his conversation history still counts as a file name.
+    const presentationUrl = rawPresentationUrl ? rawPresentationUrl.trim() : rawPresentationUrl;
     // Before FORWARD, for the same reason PRESENTATION is: FORWARD's regex is end-anchored, so a
     // marker sitting after it would make that extraction miss.
     const { cleanText: afterProvision, provision } = extractProvisionTag(afterPresentation);
-    const { cleanText, suggested } = extractFollowUpTag(afterProvision);
+    // Oscar's own name and responsibility are part of the hub, not a record, so there is nothing for
+    // him to request -- the network skill says so. Cut out anyway, or it would be read aloud.
+    const { cleanText: afterIdentity, identityRequest: ownIdentityRequest } = extractIdentityTag(afterProvision);
+    if (ownIdentityRequest) console.log(`[${AGENT.name}] Ignored an [IDENTITY: ...] marker in Oscar's own reply -- his name and responsibility are set in the hub's code.`);
+    const { cleanText, suggested: markedNext } = extractFollowUpTag(afterIdentity);
+    // Involving others is one of Oscar's permissions: switched off, a FORWARD marker is still removed
+    // from what is spoken, just not acted on.
+    const suggested = turnPermissions.forward ? markedNext : [];
+    if (markedNext.length && !turnPermissions.forward) console.log(`[${AGENT.name}] Not involving ${markedNext.join(', ')} -- switched off in his permissions.`);
     // Split unconditionally, not only when actually presenting: a [SLIDE] marker that survived
     // into the TTS would be read out loud ("bracket slide"). Rejoining the segments is what the
     // non-presenting paths below speak, so a stray marker simply disappears.
@@ -1110,12 +1394,13 @@ function askOscarDirectly(userText, myRequestId) {
     const spokenText = slideSegments.join(' ');
     // See the same line in node-agent.js: shows the RAW marker before any check, otherwise
     // "nothing attempted" can't be told apart from "attempted, but discarded".
-    console.log(`[${AGENT.name}] Marker in raw text: ${suggested.length ? suggested.join(', ') : '(none)'}`);
-    console.log(`[${AGENT.name}] Presentation marker: ${presentationUrl || '(none)'}${slideSegments.length > 1 ? `, ${slideSegments.length} slides` : ''}`);
+    console.log(`[${AGENT.name}] Marker in raw text: ${markedNext.length ? markedNext.join(', ') : '(none)'}`);
+    console.log(`[${AGENT.name}] Presentation marker: ${presentationUrl ? presentationLabel(presentationUrl) : '(none)'}${slideSegments.length > 1 ? `, ${slideSegments.length} slides` : ''}`);
     // Provisioning is handled before presenting: it changes what Oscar has to SAY (the pairing
     // code has to be read out, and only the hub knows it -- the model cannot have put it in its
     // own reply), so the spoken text is rewritten here before it reaches synthesis.
-    if (provision) {
+    if (provision && !turnPermissions.provision) console.log(`[${AGENT.name}] Ignored a [PROVISION: ...] marker -- setting up new agents is switched off in his permissions.`);
+    if (provision && turnPermissions.provision) {
       const res = startProvisioning(provision);
       const extra = res.error
         ? ` ${res.error}`
@@ -1123,38 +1408,432 @@ function askOscarDirectly(userText, myRequestId) {
       say((spokenText + extra).trim(), myRequestId, AGENT.name, true, suggested);
       return;
     }
-    if (presentationUrl) {
-      if (mainDisplayTarget) {
-        presentFromOscar(slideSegments, myRequestId, presentationUrl, suggested);
-        return;
-      }
-      console.log('[maindisplay] Presentation requested, but no main display assigned -- speaking normally.');
+    if (presentationUrl && !turnPermissions.presentations) console.log(`[${AGENT.name}] Not presenting ${presentationLabel(presentationUrl)} -- switched off in his permissions.`);
+    if (presentationUrl && turnPermissions.presentations) {
+      // With a main display the deck goes there; without one Oscar shows it on his own screen.
+      // presentFromOscar decides which (user's decision 2026-09-15: no main display means
+      // everyone presents on their own).
+      presentFromOscar(slideSegments, myRequestId, presentationUrl, suggested);
+      return;
     }
     say(spokenText, myRequestId, AGENT.name, true, suggested);
   });
 }
 
-function askAgent(userText, targetAgent = null) {
+// Everything /agent and /network say goes to the console and to Oscar's chat page, since either is
+// where the user may have typed it. Both are local-only -- the chat page refuses input from anywhere
+// but this machine (see overlay-server.js) -- which is what makes a typed /agent the user's decision.
+function tellUser(text, chatText = text) {
+  console.log(text);
+  overlay.pushChat({ agent: AGENT.name, from: 'system', text: chatText });
+}
+
+function announcePendingIdentity(nodeName, shownAs) {
+  const introduced = pendingIdentity.get(nodeName);
+  if (!introduced) return;
+  const key = JSON.stringify([introduced.kind, introduced.name, introduced.domain, introduced.reason]);
+  if (announcedIntroductions.get(nodeName) === key) return;
+  announcedIntroductions.set(nodeName, key);
+  if (introduced.kind === 'request') { announceRequest(nodeName, introduced); return; }
+  const who = introduced.name ? `calls itself "${introduced.name}"` : 'gave no usable name';
+  const what = introduced.domain ? `, responsible for: ${introduced.domain}` : '';
+  const intro = agentHome.closeSentence(`It ${who}${what}`);
+  tellUser([
+    `[network] The hub has no record of "${nodeName}" yet. ${intro}`,
+    `[network] Until you decide, it is listed as "${shownAs}" with no responsibility, so nothing is routed to it by topic.`,
+    `[network]   /agent confirm ${nodeName}   accepts that`,
+    `[network]   /agent name ${nodeName} <Name>  and  /agent domain ${nodeName} <text>   set it yourself`
+  ].join('\n'), `"${nodeName}" is new to the hub. ${intro} Until you decide, it is listed as ${shownAs} with no responsibility. Type /agent confirm ${nodeName} or use the buttons at the top of this page to accept that, or set it yourself with /agent name ${nodeName} <Name> and /agent domain ${nodeName} <text>.`);
+}
+
+// A machine said hello: admit it under the name the hub decides (admitIdentity), then bring the
+// overlay, every node and Oscar's own skill data up to date.
+function admitNode(nodeName, hello) {
+  const who = admitIdentity(nodeName, hello);
+  if (!who) {
+    tellUser(`[network] "${nodeName}" connected, but neither the name it gave nor "${nodeName}" is free. Give it one with /agent name ${nodeName} <Name>.`);
+    return;
+  }
+  // A machine saying hello again -- a reconnect, or renamed while it was offline -- must not leave an
+  // entry under its previous name behind, nor a main display that still points at that name.
+  const previous = agentNameOfNode(nodeName);
+  if (previous && previous !== who.name) remoteAgents.delete(previous);
+  remoteAgents.set(who.name, { nodeName, domain: who.domain, screen: normalizeScreen(hello.screen) });
+  if (mainDisplayTarget && mainDisplayTarget.nodeName === nodeName) mainDisplayTarget.agentName = who.name;
+  console.log(`[network] Agent "${who.name}" on node "${nodeName}" is here.${who.domain ? ' Responsible for: ' + who.domain : ''}`);
+  if (!who.recorded) announcePendingIdentity(nodeName, who.name);
+  if (hello.mainDisplay === true && !mainDisplaySetManually) {
+    mainDisplayTarget = { agentName: who.name, nodeName };
+    console.log(`[maindisplay] "${who.name}" is now automatically the main display (configuration).`);
+  }
+  // If this (newly connecting/reconnecting) node is currently the main display, but the hub itself
+  // isn't tracking any presentation (e.g. after a hub restart), the node might still be showing a
+  // stale local presentation -- sync it to be safe.
+  if (mainDisplayTarget && mainDisplayTarget.nodeName === nodeName && !currentPresentation) {
+    try { hub.send(nodeName, { type: 'clear-presentation' }); } catch (e) {}
+  }
+  // Same here: immediately send out the expanded name list, so "Nova, ..." also works right away
+  // even if the browser was already open BEFORE she connected.
+  setOverlayState(overlay.getState());
+  broadcastPeerLists(); // every node (including the new one) gets the current roster view
+  refreshSkillData();
+  const queued = queuedDeclines.get(nodeName);
+  if (queued) {
+    queuedDeclines.delete(nodeName);
+    sendDecline(nodeName, queued);
+  }
+}
+
+// A rename in the middle of work would strand that work under the old name: the running request, a
+// held-back reaction, a queued or relayed presentation and the rest of a follow-up chain are all
+// keyed by it. Waiting until the agent is quiet is simpler than moving all of them.
+function agentIsBusy(name) {
+  if (busyTargets.has(name) || pendingReactionByTarget.has(name)) return true;
+  if (displayQueue.some((entry) => entry.targetKey === name)) return true;
+  for (const relay of presentationRelays.values()) if (relay.agentName === name) return true;
+  for (const names of followUpQueues.values()) if (Array.isArray(names) && names.includes(name)) return true;
+  return false;
+}
+
+// Every change to pendingIdentity goes through these two, so the buttons on the hub's page always show
+// exactly what is waiting.
+function setPending(nodeName, entry) {
+  pendingIdentity.set(nodeName, Object.assign({ id: require('crypto').randomBytes(9).toString('hex'), reason: '' }, entry));
+  pushDecisions();
+}
+
+function clearPending(nodeName) {
+  if (pendingIdentity.delete(nodeName)) pushDecisions();
+}
+
+function pendingDecisions() {
+  return Array.from(pendingIdentity, ([nodeName, pending]) => {
+    const record = agentRecords.get(nodeName);
+    return {
+      id: pending.id, machine: nodeName, kind: pending.kind,
+      currentName: (record && record.name) || agentNameOfNode(nodeName) || nodeName,
+      currentDomain: record ? record.domain : '',
+      name: pending.name, domain: pending.domain, reason: pending.reason || ''
+    };
+  });
+}
+
+function pushDecisions() {
+  overlay.pushDecisions(pendingDecisions());
+}
+
+// A recorded agent asks for its own name or responsibility to change. What can be refused mechanically
+// is refused right away, with a code the node turns into a fixed sentence for the agent; everything else
+// waits for the user, and none of it takes effect before the user accepts. The machine it applies to is
+// the one whose certificate the request arrived with -- nothing in the message can name another.
+function receiveIdentityRequest(nodeName, msg) {
+  const record = agentRecords.get(nodeName);
+  if (!record) return declineIdentityRequest(nodeName, 'unconfirmed');
+  const name = typeof msg.name === 'string' && msg.name.trim() ? agentRegistry.cleanName(msg.name) : record.name;
+  const domain = typeof msg.domain === 'string' ? agentRegistry.cleanDomain(msg.domain) : record.domain;
+  const reason = agentRegistry.cleanText(msg.reason, agentRegistry.REASON_MAX);
+  if (msg.malformed === true || !name || domain === null || !reason) return declineIdentityRequest(nodeName, 'invalid');
+  if (name === record.name && domain === record.domain) return declineIdentityRequest(nodeName, 'unchanged');
+  if (name !== record.name && nameHeldBy(name, nodeName)) return declineIdentityRequest(nodeName, 'name-taken');
+  setPending(nodeName, { kind: 'request', name, domain, reason });
+  announcePendingIdentity(nodeName, record.name);
+}
+
+function declineIdentityRequest(nodeName, code) {
+  console.log(`[network] A request from "${nodeName}" to change its name or responsibility was not passed on (${code}).`);
+  sendDecline(nodeName, code);
+}
+
+function sendDecline(nodeName, code) {
+  if (hub && hub.isUp(nodeName)) {
+    try { hub.send(nodeName, { type: 'identity-declined', reason: code }); return; } catch (e) { /* queued below */ }
+  }
+  queuedDeclines.set(nodeName, code);
+}
+
+// A recorded agent's own request as the user sees it: what would change, and the reason it gave.
+function announceRequest(nodeName, pending) {
+  const record = agentRecords.get(nodeName) || { name: pending.name, domain: '' };
+  const changes = [];
+  if (pending.name !== record.name) changes.push(`name "${record.name}" -> "${pending.name}"`);
+  if (pending.domain !== record.domain) changes.push(`responsibility -> "${pending.domain}"`);
+  const reason = agentHome.closeSentence(`Reason given: ${pending.reason}`);
+  tellUser([
+    `[network] ${record.name} (${nodeName}) asks for a change: ${changes.join('; ')}.`,
+    `[network] ${reason}`,
+    `[network]   /agent confirm ${nodeName}  or  /agent reject ${nodeName}  -- or the buttons on http://localhost:${PORT}/`
+  ].join('\n'), `${record.name} asks for a change: ${changes.join('; ')}. ${reason} Use the buttons at the top of this page, or type /agent confirm ${nodeName} or /agent reject ${nodeName}.`);
+}
+
+// The user's answer to what is waiting for a machine: /agent confirm|reject, or a button (decideById).
+function decideIdentity(nodeName, accept) {
+  const pending = pendingIdentity.get(nodeName);
+  if (!pending) return tellUser(`Nothing from "${nodeName}" is waiting for a decision.`);
+  if (!accept) {
+    clearPending(nodeName);
+    if (pending.kind === 'request') {
+      sendDecline(nodeName, 'user');
+      return tellUser(`Declined: "${nodeName}" keeps its name and responsibility.`);
+    }
+    declinedIntroductions.set(nodeName, JSON.stringify({ name: pending.name, domain: pending.domain }));
+    return tellUser(`Dismissed how "${nodeName}" introduced itself. It stays listed without a responsibility until you set one with /agent name or /agent domain.`);
+  }
+  const record = agentRecords.get(nodeName);
+  const currentName = (record && record.name) || agentNameOfNode(nodeName) || nodeName.charAt(0).toUpperCase() + nodeName.slice(1);
+  setIdentity(nodeName, { name: pending.name || currentName, domain: pending.domain });
+  pushDecisions(); // if setIdentity refused (name taken, agent busy), the card stays and its buttons come back
+}
+
+// A decision as this PC's confirmation dialog states it -- from the hub's own record of the request, never
+// from the card an agent may have reworded. The name is checked; a responsibility is an agent's own words,
+// so it is quoted, shortened, and cleaned of anything invisible (device-confirm.js).
+function quoteForDialog(text) {
+  const clean = deviceConfirm.cleanText(text || 'nothing');
+  return `"${clean.length > 120 ? `${clean.slice(0, 119)}…` : clean}"`;
+}
+
+function describeDecision(nodeName, pending, accept) {
+  if (!accept) {
+    return pending.kind === 'request'
+      ? `AliveAgents: decline the change machine ${nodeName} asked for. Its name and responsibility stay as they are.`
+      : `AliveAgents: dismiss how machine ${nodeName} introduced itself. Nothing is recorded.`;
+  }
+  const record = agentRecords.get(nodeName);
+  if (pending.kind === 'request') {
+    const changes = [];
+    if (record && pending.name !== record.name) changes.push(`it will be called ${pending.name}`);
+    if (!record || pending.domain !== record.domain) changes.push(`it will be responsible for ${quoteForDialog(pending.domain)}`);
+    return `AliveAgents: accept for machine ${nodeName}: ${changes.join(', and ')}.`;
+  }
+  const name = pending.name || (record && record.name) || agentNameOfNode(nodeName) || nodeName.charAt(0).toUpperCase() + nodeName.slice(1);
+  return `AliveAgents: record machine ${nodeName} as ${name}, responsible for ${quoteForDialog(pending.domain)}.`;
+}
+
+// A click on a decision card only asks. An agent that can control the browser can press the button or
+// reword the card, so this PC's own dialog states the decision, and nothing is decided before the user says
+// yes there. reply answers the page that clicked.
+async function decideById(id, accept, reply = () => {}) {
+  let found = null;
+  for (const [nodeName, pending] of pendingIdentity) {
+    if (pending.id === id) found = { nodeName, pending };
+  }
+  if (!found) {
+    tellUser('That request is no longer waiting: it was already decided, or replaced by a newer one.');
+    pushDecisions();
+    return reply({ error: 'This request is no longer waiting.' });
+  }
+  const answer = await confirmer.ask(describeDecision(found.nodeName, found.pending, accept));
+  if (!answer.ok) {
+    console.log(`[network] Nothing decided about "${found.nodeName}": ${answer.reason}`);
+    return reply({ error: `${answer.reason} Nothing changed.` });
+  }
+  // The dialog described the request as it was when it opened; a newer one may have replaced it since.
+  if (pendingIdentity.get(found.nodeName) !== found.pending) {
+    pushDecisions();
+    return reply({ error: 'The request changed while the dialog was open, so nothing was decided. Look at it again.' });
+  }
+  decideIdentity(found.nodeName, accept);
+  reply({ ok: true });
+}
+
+// The one place a name or responsibility changes. Written to disk first, then applied to the running
+// network, so a change the file did not take never shows up anywhere.
+function setIdentity(nodeName, wanted) {
+  const name = agentRegistry.cleanName(wanted.name);
+  if (!name) return tellUser(`"${wanted.name}" cannot be a name: 1 to 32 letters, digits, spaces, dashes or underscores, starting with a letter.`);
+  const domain = agentRegistry.cleanDomain(wanted.domain);
+  if (domain === null) return tellUser(`That responsibility is too long: ${agentRegistry.DOMAIN_MAX} characters at most. One sentence is enough.`);
+  const held = nameHeldBy(name, nodeName);
+  if (held) return tellUser(`"${name}" is taken: ${held}.`);
+  const current = agentNameOfNode(nodeName);
+  if (current && current !== name && agentIsBusy(current)) {
+    return tellUser(`${current} is in the middle of something. Try the rename again once it is quiet, or after /reset.`);
+  }
+  try {
+    agentRecords.set(nodeName, { name, domain });
+  } catch (e) {
+    return tellUser(`Could not save that to ${NET_CONFIG_FILE}: ${e.message}`);
+  }
+  clearPending(nodeName);
+  announcedIntroductions.delete(nodeName);
+  declinedIntroductions.delete(nodeName);
+  if (mainDisplayTarget && mainDisplayTarget.nodeName === nodeName) mainDisplayTarget.agentName = name;
+  if (lastRoutedTarget && lastRoutedTarget.nodeName === nodeName) lastRoutedTarget.agentName = name;
+  if (current) {
+    const info = remoteAgents.get(current);
+    info.domain = domain;
+    if (current !== name) {
+      remoteAgents.delete(current);
+      remoteAgents.set(name, info);
+      if (activeRequestByTarget.has(current)) {
+        activeRequestByTarget.set(name, activeRequestByTarget.get(current));
+        activeRequestByTarget.delete(current);
+      }
+    }
+    setOverlayState(overlay.getState());
+    broadcastPeerLists();
+    refreshSkillData();
+  } else if (hub && hub.isUp(nodeName) && lastHello.has(nodeName)) {
+    admitNode(nodeName, lastHello.get(nodeName));
+  }
+  tellUser(agentHome.closeSentence(`"${nodeName}" is now ${name}, responsible for: ${domain || `nothing yet (/agent domain ${nodeName} <text>)`}`));
+}
+
+// A machine by its certificate name or by the name it is spoken to by -- whichever the user typed.
+// Only machines this hub has enrolled count.
+function resolveMachine(word) {
+  const enrolled = netConfig && Array.isArray(netConfig.peers) ? netConfig.peers : [];
+  const lower = String(word || '').toLowerCase();
+  if (enrolled.includes(lower)) return lower;
+  for (const [name, info] of remoteAgents) {
+    if (name.toLowerCase() === lower && enrolled.includes(info.nodeName)) return info.nodeName;
+  }
+  const recorded = agentRecords.nodeWithName(word);
+  return recorded && enrolled.includes(recorded) ? recorded : null;
+}
+
+const AGENT_USAGE = [
+  'Who each agent is -- changed only by you, never by an agent:',
+  '  /agent confirm <machine>          accept what a machine introduced or an agent asked for',
+  '  /agent reject <machine>           decline it',
+  '  /agent name <machine> <Name>      the name it is spoken to by',
+  '  /agent domain <machine> <text>    what it is responsible for',
+  '<machine> is its certificate name (e.g. toby) or its current one-word name. /network lists them.',
+  `Requests also appear with Accept and Decline buttons on http://localhost:${PORT}/.`
+].join('\n');
+
+const AGENT_COMMAND_RE = /^(confirm|reject|name|domain)\s+(\S+)\s*([\s\S]*)$/i;
+
+// What a typed /agent would change, worded for the confirmation dialog -- or null when it changes nothing
+// (usage, an unknown machine, nothing waiting, a name that is refused anyway). stillCurrent tells whether
+// what the dialog described is still what the command would act on.
+function describeAgentCommand(args) {
+  const match = AGENT_COMMAND_RE.exec(args);
+  if (!match) return null;
+  const verb = match[1].toLowerCase();
+  const value = match[3].trim();
+  const nodeName = resolveMachine(match[2]);
+  if (!nodeName) return null;
+  const pending = pendingIdentity.get(nodeName);
+  const recordThen = JSON.stringify(agentRecords.get(nodeName) || null);
+  const stillCurrent = () => pendingIdentity.get(nodeName) === pending && JSON.stringify(agentRecords.get(nodeName) || null) === recordThen;
+  if (verb === 'confirm' || verb === 'reject') {
+    return pending ? { text: describeDecision(nodeName, pending, verb === 'confirm'), stillCurrent } : null;
+  }
+  if (verb === 'name') {
+    const name = agentRegistry.cleanName(value);
+    if (!name || nameHeldBy(name, nodeName)) return null;
+    return { text: `AliveAgents: machine ${nodeName} will be called ${name}.`, stillCurrent };
+  }
+  const domain = agentRegistry.cleanDomain(value);
+  if (!value || domain === null) return null;
+  return { text: `AliveAgents: machine ${nodeName} will be responsible for ${quoteForDialog(domain)}.`, stillCurrent };
+}
+
+// /agent typed into the hub's page changes nothing until this PC's confirmation dialog has said what it
+// will do: a browser an agent controls can type there too. What changes nothing is answered right away.
+async function confirmTypedAgentCommand(args) {
+  const plan = describeAgentCommand(args);
+  if (!plan) return agentCommand(args);
+  const answer = await confirmer.ask(plan.text);
+  if (!answer.ok) return tellUser(`${answer.reason} Nothing changed. /agent also works in the console window.`);
+  if (!plan.stillCurrent()) return tellUser('Something changed while the dialog was open, so nothing was done. Type it again.');
+  agentCommand(args);
+}
+
+function agentCommand(args) {
+  const match = AGENT_COMMAND_RE.exec(args);
+  if (!match) return tellUser(AGENT_USAGE);
+  const verb = match[1].toLowerCase();
+  const value = match[3].trim();
+  const nodeName = resolveMachine(match[2]);
+  if (!nodeName) return tellUser(`No machine called "${match[2]}" is enrolled on this network. /network lists them.`);
+  const record = agentRecords.get(nodeName);
+  const pending = pendingIdentity.get(nodeName);
+  const currentName = (record && record.name) || agentNameOfNode(nodeName) || (pending && pending.name)
+    || nodeName.charAt(0).toUpperCase() + nodeName.slice(1);
+  if (verb === 'confirm' || verb === 'reject') {
+    if (pending) return decideIdentity(nodeName, verb === 'confirm');
+    return tellUser(record
+      ? `Nothing from "${nodeName}" is waiting for a decision. Its record: ${agentHome.closeSentence(`${record.name}, responsible for: ${record.domain || 'nothing yet'}`)} Change it with /agent name or /agent domain.`
+      : `"${nodeName}" has not introduced itself since the hub started. It will once it connects.`);
+  }
+  if (!value) return tellUser(AGENT_USAGE);
+  // Setting one half never adopts the other half of an unconfirmed introduction: a name alone keeps
+  // the responsibility empty, and a responsibility alone keeps the name the machine is listed under.
+  if (verb === 'name') return setIdentity(nodeName, { name: value, domain: record ? record.domain : '' });
+  return setIdentity(nodeName, { name: currentName, domain: value });
+}
+
+// Every enrolled machine, connected or not, with who the hub says it is -- and, for one without a
+// record, how it introduced itself.
+function describeNetwork() {
+  const enrolled = netConfig && Array.isArray(netConfig.peers) ? netConfig.peers : [];
+  if (!enrolled.length) return 'No agents are enrolled on this network yet.';
+  return enrolled.map((nodeName) => {
+    const record = agentRecords.get(nodeName);
+    const name = agentNameOfNode(nodeName);
+    const shown = name || (record && record.name) || '(no name yet)';
+    const state = name && hub && hub.isUp(nodeName) ? 'connected' : 'offline';
+    const line = `${shown} (${nodeName}) - ${record ? (record.domain || 'no responsibility set') : 'no record yet'}: ${state}`;
+    const introduced = pendingIdentity.get(nodeName);
+    if (!introduced) return line;
+    if (introduced.kind === 'request') {
+      return `${line}\n    asks to become ${introduced.name}, responsible for: ${introduced.domain || 'nothing'} -- reason: ${introduced.reason} -- /agent confirm ${nodeName} or /agent reject ${nodeName}`;
+    }
+    return `${line}\n    introduced itself as ${introduced.name ? `"${introduced.name}"` : '(no usable name)'}${introduced.domain ? `, responsible for: ${introduced.domain}` : ''} -- /agent confirm ${nodeName}`;
+  }).join('\n');
+}
+
+// source: 'console' (typed into this process), 'typed' (the chat box on the hub's own page) or 'voice'
+// (the microphone). Only the first two may change who an agent is -- see /agent below.
+function askAgent(userText, targetAgent = null, source = 'console') {
+  // A pasted text beyond what an agent can take is turned away here, with a sentence in the chat it came
+  // from, before anyone is interrupted or anything is sent on (claude-cli.js).
+  if (userText.length > MESSAGE_MAX_CHARS) {
+    const sentence = tooLongSentence(userText.length);
+    console.log(`[input] ${sentence}`);
+    overlay.pushChat({ agent: targetAgent || AGENT.name, from: 'system', text: sentence });
+    return;
+  }
   if (userText === '/reset') {
     sessionId = null;
     try { fs.unlinkSync(SESSION_FILE); } catch (e) {}
     lastRoutedTarget = null; // a deliberate restart should no longer "stick" to the last agent
-    oscarPeersDirty = true; // a fresh session should definitely get the peer list again
     followUpQueues.clear(); originalQuestionByRequest.clear(); lastAnswerByRequest.clear(); chainLengthByRequest.clear();
     activeRequestByTarget.clear(); busyTargets.clear(); pendingReactionByTarget.clear(); displayQueue.length = 0;
-    currentPresentation = null; presentationOwnerRequestId = null;
+    currentPresentation = null; presentationOwnerRequestId = null; presentationRelays.clear();
     if (hub) hub.broadcast({ type: 'reset' }); // reset remote agents too (including clear-presentation there, see node-agent.js)
     console.log('Conversation reset. The next message starts a new session.');
     return;
   }
   if (userText === '/network') {
-    const list = Array.from(remoteAgents.entries())
-      .map(([agentName, info]) => `${agentName} (${info.nodeName})${info.domain ? ' - ' + info.domain : ''}: ${hub && hub.isUp(info.nodeName) ? 'connected' : 'offline'}`);
-    console.log(list.length ? list.join('\n') : 'No remote agents connected.');
+    tellUser(describeNetwork());
+    return;
+  }
+  // An agent's name and responsibility: the only way either changes (see agent-registry.js).
+  if (userText === '/agent' || userText.startsWith('/agent ')) {
+    // Never by voice: speech recognition turns whatever is said near the microphone into text, and
+    // another agent's loudspeaker is exactly that. A change has to be typed or clicked.
+    if (source === 'voice') {
+      tellUser('Changing who an agent is has to be typed or clicked on this page, not spoken.');
+      return;
+    }
+    // Typed on the page: a browser an agent controls can type there too, so this PC's confirmation
+    // dialog has to say what the command does first. Typed into the console window it applies directly.
+    if (source === 'typed') {
+      confirmTypedAgentCommand(userText.slice('/agent'.length).trim());
+      return;
+    }
+    agentCommand(userText.slice('/agent'.length).trim());
     return;
   }
   if (userText === '/maindisplay') {
     console.log(mainDisplayTarget ? `Main display is currently "${mainDisplayTarget.agentName}".` : 'No main display assigned.');
+    return;
+  }
+  if (['/maindisplay off', '/maindisplay none'].includes(userText.toLowerCase())) {
+    clearMainDisplay();
     return;
   }
   if (userText.startsWith('/maindisplay ')) {
@@ -1295,6 +1974,9 @@ if (netConfig) {
         port: NET_PORT,
         onPeerDown: (nodeName) => {
           for (const [agentName, info] of remoteAgents) if (info.nodeName === nodeName) remoteAgents.delete(agentName);
+          lastHello.delete(nodeName);
+          // A deck that went to this node will never be reported finished now.
+          for (const [id, relay] of presentationRelays) if (relay.displayNode === nodeName) presentationRelays.delete(id);
           if (mainDisplayTarget && mainDisplayTarget.nodeName === nodeName) {
             // Target deliberately NOT set to null: isReachable() already recognizes "currently
             // not connected" on its own (see the present-request handler below), and if the same
@@ -1307,27 +1989,40 @@ if (netConfig) {
           // only at the next random state change.
           setOverlayState(overlay.getState());
           broadcastPeerLists(); // the remaining nodes should learn about the departure immediately, not only at the next /reset
-          oscarPeersDirty = true; // the network has changed -- Oscar's next turn should learn about it
+          refreshSkillData();
         },
         onMessage: (nodeName, msg) => {
-          if (msg.type === 'hello' && typeof msg.agentName === 'string') {
-            remoteAgents.set(msg.agentName, { nodeName, domain: typeof msg.domain === 'string' ? msg.domain : '' });
-            console.log(`[network] Agent "${msg.agentName}" on node "${nodeName}" is here.${msg.domain ? ' Responsible for: ' + msg.domain : ''}`);
-            if (msg.mainDisplay === true && !mainDisplaySetManually) {
-              mainDisplayTarget = { agentName: msg.agentName, nodeName };
-              console.log(`[maindisplay] "${msg.agentName}" is now automatically the main display (configuration).`);
+          // Who the machine is comes from the hub's record, not from this message -- see admitNode.
+          if (msg.type === 'hello') {
+            lastHello.set(nodeName, msg);
+            admitNode(nodeName, msg);
+          }
+          // Attributed by certificate like everything else: a machine can only ever ask for itself.
+          if (msg.type === 'identity-request') receiveIdentityRequest(nodeName, msg);
+          // A node whose own permissions say "no files" turned a delivery away.
+          if (msg.type === 'file-refused') {
+            const who = agentNameOfNode(nodeName);
+            if (who) tellUser(`${who} does not accept files right now -- switched off in its permissions on its own device.`);
+          }
+          // A node's face page opened or closed, so the class of its screen changed. Rare by design:
+          // turning a phone changes nothing, the class has no orientation. It only matters to anyone
+          // while that node is the main display.
+          if (msg.type === 'screen') {
+            for (const [, info] of remoteAgents) {
+              if (info.nodeName === nodeName) info.screen = normalizeScreen(msg.screen);
             }
-            // If this (newly connecting/reconnecting) node is currently the main display, but the
-            // hub itself isn't tracking any presentation (e.g. after a hub restart), the node
-            // might still be showing a stale local presentation -- sync it to be safe.
-            if (mainDisplayTarget && mainDisplayTarget.nodeName === nodeName && !currentPresentation) {
-              try { hub.send(nodeName, { type: 'clear-presentation' }); } catch (e) {}
+            if (mainDisplayTarget && mainDisplayTarget.nodeName === nodeName) {
+              broadcastPeerLists();
+              refreshSkillData();
             }
-            // Same here: immediately send out the expanded name list, so "Nova, ..." also works
-            // right away even if the browser was already open BEFORE she connected.
-            setOverlayState(overlay.getState());
-            broadcastPeerLists(); // every node (including the new one) gets the current roster view
-            oscarPeersDirty = true; // the network has changed -- Oscar's next turn should learn about it
+          }
+          // Every other message a node sends about itself names its sender too, and that name used to
+          // be believed like the hello's: one machine could answer, present or finish in another's
+          // name. The certificate says which machine sent it; the name is looked up from that.
+          if (msg.type === 'answer' || msg.type === 'speech-done' || msg.type === 'speak-request' || msg.type === 'present-request') {
+            const own = agentNameOfNode(nodeName);
+            if (!own) return; // not admitted (yet), so nothing it says can be attributed
+            msg.agentName = own;
           }
           if (msg.type === 'answer' && typeof msg.text === 'string') {
             // The remote agent speaks the reply ITSELF on its own machine -- it only gets logged
@@ -1352,40 +2047,67 @@ if (netConfig) {
           // above, no new counter.
           if (msg.type === 'present-request' && typeof msg.url === 'string') {
             const wireSegments = normalizePresentSegments(msg);
-            if (!wireSegments) return; // no usable audio -- not a presentation this hub can relay
+            if (!wireSegments) return; // nothing usable -- neither playable audio nor text to speak
             if (msg.requestId !== activeRequestByTarget.get(msg.agentName)) return; // stale, ignore
+            // The page comes along (see readOwnContent in overlay-server.js). A link to another
+            // machine's page WITHOUT it could only be shown by fetching it across the WiFi, which
+            // nothing does any more -- so it is handed back, and the presenter shows it on its own
+            // screen, where it needs no network at all. Only an older node-agent.js sends one.
+            const page = normalizePage(msg.page);
+            if (!page && !isWebsite(msg.url)) {
+              console.log(`[maindisplay] "${msg.agentName}" sent a presentation link without its page -- handing it back to show on its own screen.`);
+              try { hub.send(nodeName, { type: 'present-declined', requestId: msg.requestId }); } catch (e) { cleanupFollowUp(msg.requestId); }
+              return;
+            }
             if (!mainDisplayTarget || !isReachable(mainDisplayTarget.agentName)) {
-              console.log(`[maindisplay] "${msg.agentName}" wanted to present, but no main display is assigned or reachable.`);
-              cleanupFollowUp(msg.requestId); // otherwise followUpQueues/etc. for this requestId stay stuck
+              // Nowhere to show it: hand it back, and the node presents on its own screen (user's
+              // decision, 2026-09-15). The peers broadcast normally prevents this already; it covers
+              // the moment between a display dropping off and the news reaching the presenter. The
+              // follow-up chain is NOT cleaned up here: the node's own-screen presentation reports
+              // 'answer' and 'speech-done' like any reply and carries the chain on from there.
+              console.log(`[maindisplay] "${msg.agentName}" wanted to present, but no main display is reachable -- handing it back to show on its own screen.`);
+              try { hub.send(nodeName, { type: 'present-declined', requestId: msg.requestId }); } catch (e) { cleanupFollowUp(msg.requestId); }
               return;
             }
             const suggestedNext = Array.isArray(msg.suggestedNext) ? msg.suggestedNext : [];
             const text = typeof msg.text === 'string' ? msg.text : '';
             if (mainDisplayTarget.nodeName === null) {
               // The hub is itself the main display -- no network hop needed, play locally right away.
-              const segments = writeSegmentFiles(wireSegments);
-              if (!segments) { cleanupFollowUp(msg.requestId); return; }
-              playPresentationLocally(segments, msg.agentName, msg.url, text, msg.requestId, suggestedNext, msg.faceStyle);
+              // Async: slides may have to be synthesized first (see prepareSegmentFiles).
+              prepareSegmentFiles(wireSegments, (segments) => {
+                if (!segments) { cleanupFollowUp(msg.requestId); return; }
+                if (msg.requestId !== activeRequestByTarget.get(msg.agentName)) {
+                  // Superseded while the slides were being prepared -- same rule as the check above.
+                  for (const s of segments) fs.unlink(s.filePath, () => {});
+                  return;
+                }
+                playPresentationLocally(segments, msg.agentName, msg.url, text, msg.requestId, suggestedNext, msg.faceStyle, msg.faceTint, page);
+              });
             } else {
               const deliver = () => {
                 try {
                   pendingPresentationSuggested.set(msg.requestId, suggestedNext);
+                  presentationRelays.set(msg.requestId, { agentName: msg.agentName, displayNode: mainDisplayTarget.nodeName });
                   presentationOwnerRequestId = msg.requestId;
-                  currentPresentation = { agentName: msg.agentName, url: msg.url, faceStyle: msg.faceStyle, slide: 0 };
+                  currentPresentation = { agentName: msg.agentName, url: msg.url || (page ? page.name : ''), faceStyle: msg.faceStyle, faceTint: normalizeTint(msg.faceTint), slide: 0 };
                   // Relayed as normalized segments rather than passing msg straight through -- the
                   // sending node may be an older build that only set audioBase64, and the display
                   // node should get one consistent shape either way.
                   hub.send(mainDisplayTarget.nodeName, {
-                    type: 'present', requestId: msg.requestId, agentName: msg.agentName, url: msg.url, text, faceStyle: msg.faceStyle,
+                    type: 'present', requestId: msg.requestId, agentName: msg.agentName, url: page ? '' : msg.url, page: page || undefined, text, faceStyle: msg.faceStyle, faceTint: msg.faceTint,
                     segments: wireSegments,
                     audioBase64: wireSegments.length === 1 ? wireSegments[0].audioBase64 : undefined
                   });
-                  console.log(`[maindisplay] "${msg.agentName}" is presenting on "${mainDisplayTarget.agentName}"${wireSegments.length > 1 ? ` (${wireSegments.length} slides)` : ''}: ${msg.url}`);
+                  console.log(`[maindisplay] "${msg.agentName}" is presenting on "${mainDisplayTarget.agentName}"${wireSegments.length > 1 ? ` (${wireSegments.length} slides)` : ''}: ${page ? page.name : msg.url}`);
                 } catch (e) {
                   // e.g. MAX_MSG_BYTES exceeded (see agent-net.js) -- avoid crashing, cleanly abandon
                   // the operation instead of taking the whole process down with it.
-                  console.error('[maindisplay] Could not forward presentation:', e.message);
-                  cleanupFollowUp(msg.requestId);
+                  console.error('[maindisplay] Could not forward presentation, handing it back to its presenter:', e.message);
+                  pendingPresentationSuggested.delete(msg.requestId);
+                  presentationRelays.delete(msg.requestId);
+                  currentPresentation = null;
+                  presentationOwnerRequestId = null;
+                  try { hub.send(nodeName, { type: 'present-declined', requestId: msg.requestId }); } catch (err) { cleanupFollowUp(msg.requestId); }
                 }
               };
               if (currentPresentation && msg.requestId !== presentationOwnerRequestId) {
@@ -1403,10 +2125,10 @@ if (netConfig) {
           if (msg.type === 'speak-request' && typeof msg.agentName === 'string') {
             const deliver = () => {
               if (currentPresentation && msg.requestId === presentationOwnerRequestId) {
-                currentPresentation = Object.assign({}, currentPresentation, { agentName: msg.agentName, faceStyle: msg.faceStyle });
+                currentPresentation = Object.assign({}, currentPresentation, { agentName: msg.agentName, faceStyle: msg.faceStyle, faceTint: normalizeTint(msg.faceTint) });
               }
               try {
-                hub.send(nodeName, { type: 'display-go', requestId: msg.requestId, updatePresentationSpeaker: !!currentPresentation, agentName: msg.agentName, faceStyle: msg.faceStyle });
+                hub.send(nodeName, { type: 'display-go', requestId: msg.requestId, updatePresentationSpeaker: !!currentPresentation, agentName: msg.agentName, faceStyle: msg.faceStyle, faceTint: msg.faceTint });
               } catch (e) {}
             };
             const isDisplayTarget = mainDisplayTarget && mainDisplayTarget.nodeName === nodeName;
@@ -1417,13 +2139,17 @@ if (netConfig) {
               deliver();
             }
           }
-          if (msg.type === 'presentation-done' && typeof msg.agentName === 'string') {
+          if (msg.type === 'presentation-done') {
             // Comes back from the node that just SERVED AS THE MAIN DISPLAY, once playback is
-            // done -- requestId/agentName belong to the original presenter (see node-agent.js),
-            // not the displaying node itself.
+            // done -- requestId belongs to the original presenter's chain (see node-agent.js).
+            // Accepted only from the node the deck was actually sent to, and finished for the
+            // presenter recorded when it was sent; the agentName inside is not believed.
+            const relay = presentationRelays.get(msg.requestId);
+            if (!relay || relay.displayNode !== nodeName) return;
+            presentationRelays.delete(msg.requestId);
             const suggestedNext = pendingPresentationSuggested.get(msg.requestId) || [];
             pendingPresentationSuggested.delete(msg.requestId);
-            onSpeechFinished(msg.requestId, msg.agentName, typeof msg.text === 'string' ? msg.text : '', suggestedNext);
+            onSpeechFinished(msg.requestId, relay.agentName, typeof msg.text === 'string' ? msg.text : '', suggestedNext);
           }
         }
       });
@@ -1435,8 +2161,8 @@ if (netConfig) {
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 console.log(`Bridge is running on port ${PORT}.`);
-console.log('Open any webpage with the Tampermonkey overlay, then type here and press Enter.');
-console.log('Tip: "/reset" starts a new conversation, "/network" shows the connected agents, "/maindisplay <Name>" sets the main display.');
+console.log('Open http://localhost:' + PORT + '/ in a browser for the face, or type here and press Enter.');
+console.log('Tip: "/reset" starts a new conversation, "/network" lists the agents and who they are, "/agent" changes an agent\'s name or responsibility, "/maindisplay <Name>" sets the main display, "/maindisplay off" lets every agent present on its own screen.');
 rl.on('line', (line) => {
-  if (line.trim()) askAgent(line.trim());
+  if (line.trim()) askAgent(line.trim(), null, 'console');
 });

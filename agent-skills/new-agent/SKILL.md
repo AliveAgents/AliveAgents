@@ -20,11 +20,26 @@ default, so only the first two really need answering.
 | **What it's for** | required | one sentence; this is what routing uses to decide when it should answer |
 | Spoken name | optional | e.g. "Ada" — defaults to the machine name, capitalized |
 | Voice | optional | `en_US-ljspeech-high.onnx` (female), `en_US-ryan-high.onnx` (male), `de_DE-kerstin-low.onnx`, `de_DE-thorsten-medium.onnx` |
-| Face | optional | `ava` or `kai` |
+| Face | optional | `ava` (rounded shell, eye pixels) or `kai` (angular shell, visor) |
 | Personality | optional | how it should speak |
+
+**Leave voice and face out unless the user cares.** The hub generates both, along with a colour
+the new agent wears — picked so it does not clash with anyone already on the network, which is
+something you cannot do by guessing, because you do not know what the others look like. Before
+this existed every new agent got the same two defaults, so the third machine to join turned up
+wearing the second one's face and speaking in its voice.
+
+If the user does have a wish ("make him sound deeper", "something green"), pass it: `piperVoice`
+for a machine that speaks through Piper, `androidTts` for a phone, `faceTint` for the colour.
+A phone has a single TTS engine, so `pitch` deepens the one voice rather than swapping in another
+— say so rather than promising a different speaker.
 
 If the user only says "set up a new agent called Ada for the calendar", that is already enough —
 ask about voice and face only if they seem to care, and otherwise say which defaults you used.
+
+The spoken name and what it is for are not final forever: the user can change both later at the
+hub, and an agent can ask for a change to its own. Only the user decides, so do not offer to rename
+an agent yourself.
 
 ## Then trigger it
 
@@ -35,7 +50,14 @@ Append at the very end of your reply, exactly once:
 ```
 
 - `self` is required and must be lowercase letters, digits, `-` or `_`.
-- Everything else is optional — leave a field out rather than guessing a value.
+- Everything else is optional — leave a field out rather than guessing a value. A field you omit
+  is generated; a field you invent is used as-is, so omitting is the better failure.
+- `faceTint` takes exactly `idle`, `thinking` and `speaking`, each a plain `#rrggbb`.
+  Anything else is rejected whole and the generated colour is used instead. Keep `thinking`
+  amber — it means the same thing on every agent's face, and an agent whose own colour is amber
+  cannot be told apart from one that is busy.
+- `androidTts` takes `pitch` (0.75–1.25) and `rate` (0.95–1.05) for a phone. Outside that range
+  it stops sounding like a voice.
 - **Plain JSON with no arrays.** The marker ends at the first `]`, so an array would cut the
   payload in half.
 - Do not invent a pairing code, and do not mention one in your own words. You do not know it — the
@@ -55,15 +77,29 @@ nothing has to be copied by hand. Only its certificate is exchanged, and the cod
 the exchange is with the right machine rather than someone else on the network.
 
 Afterwards, on that machine: drop in the voice model, set up the Claude token, run
-`start-node.bat`, and install the browser overlay from
-`http://localhost:8787/agent-face-overlay.user.js`. Mention these only if asked — `enroll.bat`
-prints the list when it finishes.
+`start-node.bat`, and open `http://localhost:8787/` in a browser — the face is served there, no
+browser extension needed. Mention these only if asked — the enroll script prints the list when it
+finishes.
+
+## If the new machine is a phone
+
+An Android phone can host an agent too, through Termux and without root. It needs one preparation
+step first, run on the phone inside a clone of the repository:
+
+```
+bash setup-termux.sh
+```
+
+It then joins with `node enroll.js <hub-ip> <code> <name>` instead of `enroll.bat`, and starts with
+`bash start-node.sh`. A phone speaks through its own text-to-speech engine, so a Piper voice does not
+apply to it: leave `piperVoice` out, and set `androidTts` only if the user wants a particular sound.
 
 ## When something goes wrong
 
 The hub replies through you, so just pass on what it says. The common cases:
 
 - **Name already taken** — that agent exists; suggest a different name.
+- **Spoken name already taken** — another agent already answers to it; suggest a different one.
 - **A window is already open** — one enrollment at a time; wait for it to finish or expire.
 - **The code expired** — windows last a few minutes. Offer to start a new one.
 

@@ -201,7 +201,9 @@ function createUpdater({ root, agentName, confirmer, isIdle = () => true, onChan
         set({ status: 'current', problem: null, latest: manifest, commit, changed: [], manual: [], checkedAt: now });
         return publicState();
       }
-      const manual = changed.filter(isManual);
+      // A start script that does not exist here is not running here either, so it can simply be written --
+      // start-node.sh on Windows, the .bat files on a phone. Only one that is there waits for a hand.
+      const manual = changed.filter((rel) => isManual(rel) && fs.existsSync(path.join(root, rel)));
       set({ status: manual.length ? 'manual' : 'available', problem: null, latest: manifest, commit, changed, manual, checkedAt: now });
       log(`[update] Version ${manifest.version} is available (${changed.length} files${manual.length ? `, needs a manual install: ${manual.join(', ')}` : ''}).`);
       return publicState();

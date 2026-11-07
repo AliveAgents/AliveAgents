@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Agent Face Overlay
 // @namespace    agent-network
-// @version      1.6
+// @version      1.7
 // @description  Shared shell for all agent faces -- automatically loads its own face
 //               (faces/<name>.js from its own local overlay-server.js) on start and briefly
 //               switches to the face of ANOTHER agent when that agent is presenting here
@@ -234,7 +234,7 @@
   // actually running" is answerable in two seconds. An installed userscript does NOT update when
   // the file on disk changes -- it has to be pasted in by hand -- and an out-of-date copy fails in
   // ways that look like a backend bug (a deck that never advances, for instance).
-  const OVERLAY_VERSION = '1.6 (screen class)';
+  const OVERLAY_VERSION = '1.7 (own microphone while the hub is away)';
 
   function mount() {
     console.log(`[agent-overlay] version ${OVERLAY_VERSION} active`);
@@ -635,9 +635,15 @@
   });
 
   function applyState(state) {
-    // The microphone button only belongs to Oscar (the hub) -- a node like Nova doesn't get
-    // micEnabled:true from the server and therefore never shows the button at all.
+    // The microphone button belongs to the hub, and to a node only while its hub is out of reach
+    // (micEnabled from the server, see node-agent.js). When it goes, listening stops with it -- the
+    // server would ignore what it heard anyway.
     micBtn.style.display = state.micEnabled === false ? 'none' : '';
+    if (state.micEnabled === false && alwaysListening) {
+      alwaysListening = false;
+      micBtn.classList.remove('listening');
+      if (recognizer) recognizer.stop();
+    }
     if (Array.isArray(state.agentNames)) knownAgentNames = state.agentNames;
     // The server is now the authoritative source for "until when does a reply still count as
     // current enough for a name-less follow-up question" -- it knows the ACTUAL end of every

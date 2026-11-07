@@ -20,7 +20,7 @@ default, so only the first two really need answering.
 | **What it's for** | required | one sentence; this is what routing uses to decide when it should answer |
 | Spoken name | optional | e.g. "Ada" — defaults to the machine name, capitalized |
 | Voice | optional | `en_US-ljspeech-high.onnx` (female), `en_US-ryan-high.onnx` (male), `de_DE-kerstin-low.onnx`, `de_DE-thorsten-medium.onnx` |
-| Face | optional | `ava` (rounded shell, eye pixels) or `kai` (angular shell, visor) |
+| Face | optional | designed automatically — only name one if the user asks for something specific |
 | Personality | optional | how it should speak |
 
 **Leave voice and face out unless the user cares.** The hub generates both, along with a colour
@@ -28,6 +28,25 @@ the new agent wears — picked so it does not clash with anyone already on the n
 something you cannot do by guessing, because you do not know what the others look like. Before
 this existed every new agent got the same two defaults, so the third machine to join turned up
 wearing the second one's face and speaking in its voice.
+
+A new agent is **always** given a newly designed face, never one that already exists on the
+network. You do not draw it and you cannot write one — a face runs as code on the page that holds
+the microphone, so nobody's text goes in there. What you may do is pick parts, and only from these
+lists; anything else is replaced by a drawn one:
+
+| part | choices |
+| --- | --- |
+| `shell` | `block`, `round`, `hex`, `tower` |
+| `eyes` | `pixel`, `visor`, `rings`, `matrix` |
+| `pattern` | `grid`, `scanlines`, `dots`, `plain` |
+| `crest` | `none`, `antenna`, `ears`, `bar` |
+| `mouth` | `smile`, `flat`, `stern` |
+| `idle` | `bob`, `breathe`, `flicker` |
+| `thinking` | `scan`, `pulse`, `orbit` |
+| `speaking` | `glow`, `throb`, `ripple` |
+
+Numbers, if the user is that specific: `corner` 0–26, `stroke` 2–6, `mouthWidth` 56–96,
+`mouthDepth` 5–14. Each one you leave out is drawn for you.
 
 If the user does have a wish ("make him sound deeper", "something green"), pass it: `piperVoice`
 for a machine that speaks through Piper, `androidTts` for a phone, `faceTint` for the colour.
@@ -46,12 +65,15 @@ an agent yourself.
 Append at the very end of your reply, exactly once:
 
 ```
-[PROVISION: {"self":"ada","agentName":"Ada","domain":"Calendar, appointments and scheduling.","piperVoice":"en_US-ljspeech-high.onnx","faceStyle":"ava"}]
+[PROVISION: {"self":"ada","agentName":"Ada","domain":"Calendar, appointments and scheduling.","piperVoice":"en_US-ljspeech-high.onnx","faceRecipe":{"shell":"round","eyes":"rings"}}]
 ```
 
 - `self` is required and must be lowercase letters, digits, `-` or `_`.
 - Everything else is optional — leave a field out rather than guessing a value. A field you omit
   is generated; a field you invent is used as-is, so omitting is the better failure.
+- `faceRecipe` takes the parts from the table above, as many or as few as the user asked for.
+  `faceStyle` is the other way round: `"ava"` or `"kai"` puts one of the two hand-written faces on
+  the new agent instead of a new design. Only pass it if the user asked for that face by name.
 - `faceTint` takes exactly `idle`, `thinking` and `speaking`, each a plain `#rrggbb`.
   Anything else is rejected whole and the generated colour is used instead. Keep `thinking`
   amber — it means the same thing on every agent's face, and an agent whose own colour is amber

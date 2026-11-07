@@ -8,6 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { WebSocketServer } = require('ws');
+const faceDesign = require('./face-design.js');
 
 // The page the overlay is opened on. Still a black, empty stage -- the face is the point -- but it
 // now also carries the file drop rail in the bottom-left corner (see stage-page.html). The rail
@@ -51,7 +52,14 @@ fs.mkdirSync(CONTENT_DIR, { recursive: true });
 const FACES_DIR = path.join(__dirname, 'faces');
 fs.mkdirSync(FACES_DIR, { recursive: true });
 
-function serveFace(req, res) {
+// ownRecipe: the face this agent had drawn for itself when it was set up, as data in its config, turned
+// into a face here (face-design.js). Deliberately generated rather than written into faces/ by anyone --
+// see that file. Passed in per server rather than kept module-wide: two servers in one process (the face
+// preview) would otherwise share one face.
+// guestRecipes: the generated faces of OTHER agents, by style name (see setGuestFace below). A
+// generated face exists only as a recipe on the machine it belongs to, so when that agent speaks or
+// presents on this screen the recipe travels with the message and is served from here.
+function serveFace(req, res, ownRecipe, guestRecipes) {
   // Access-Control-Allow-Origin is needed here, not just nice to have: the overlay script always
   // runs on a FOREIGN page via @match *://*/* (never on localhost:8787 itself), so its
   // fetch(".../faces/<name>.js") is ALWAYS a cross-origin request from the browser's point of
@@ -62,6 +70,17 @@ function serveFace(req, res) {
   // reason to restrict the header to a narrower origin.
   const CORS_HEADER = { 'Access-Control-Allow-Origin': '*' };
   const requested = decodeURIComponent(req.url.split('?')[0].slice('/faces/'.length));
+  if (requested === 'own.js' && ownRecipe) {
+    res.writeHead(200, Object.assign({ 'Content-Type': 'application/javascript; charset=utf-8' }, CORS_HEADER));
+    res.end(faceDesign.renderFaceFile('own', ownRecipe));
+    return;
+  }
+  const guestName = requested.endsWith('.js') ? requested.slice(0, -3) : '';
+  if (guestRecipes && guestRecipes.has(guestName)) {
+    res.writeHead(200, Object.assign({ 'Content-Type': 'application/javascript; charset=utf-8' }, CORS_HEADER));
+    res.end(faceDesign.renderFaceFile(guestName, guestRecipes.get(guestName)));
+    return;
+  }
   const filePath = path.join(FACES_DIR, path.basename(requested));
   if (!filePath.startsWith(FACES_DIR + path.sep) || path.extname(filePath).toLowerCase() !== '.js') {
     res.writeHead(403, CORS_HEADER); res.end('Forbidden'); return;
@@ -149,9 +168,11 @@ function isOwnPage(req, port) {
   return origin === undefined || [`http://localhost:${port}`, `http://127.0.0.1:${port}`, `http://[::1]:${port}`].includes(origin);
 }
 
-// onUserInput(text) is DELIBERATELY optional: only the hub (Oscar) passes the browser's
-// microphone through to task dispatch. A node omits this callback so that ONLY Oscar
-// distributes tasks by voice -- not every node independently.
+// onUserInput(text) is optional, and inputEnabled() says whether it is open right now. The hub passes
+// the browser's microphone through to task dispatch at all times. A node passes it too, but opens it
+// only while its hub is out of reach (user's wish, 2026-09-22: take the phone along, leave the rest at
+// home) -- while the hub is there, it stays the one microphone of the network. inputEnabled is checked
+// here, on every message, not only by the page that hides the button.
 // getAgents/onFileUpload are likewise hub-only: the file drop UI lists the whole network and
 // routes uploads, which only the hub knows how to do. A node passes neither and the routes stay off.
 // The class of a screen, as the face page reports it (screenClass in agent-face-overlay.user.js): the
@@ -265,7 +286,15 @@ function presentationLabel(marker) {
 // in agent-bridge-server.js), listed for the buttons on this page, and a click on one of them.
 // onPageMessage(msg, reply) receives the face page's requests that carry a reqId (permissions, passkey
 // confirmations -- see permissions.js); reply(obj) answers exactly the page that asked.
-function startOverlayServer({ port, onUserInput, getAgents, onFileUpload, onScreenChange, getDecisions, onDecision, onPageMessage, log = console.log }) {
+// faceRecipe: this agent's own face as data (face-design.js). With one, the page may ask for /faces/own.js
+// and gets a face nobody else has; without one it keeps asking for the hand-written faces in faces/.
+function startOverlayServer({ port, onUserInput, inputEnabled = () => true, getAgents, onFileUpload, onScreenChange, getDecisions, onDecision, onPageMessage, faceRecipe = null, log = console.log }) {
+  const ownRecipe = faceRecipe ? faceDesign.cleanRecipe(faceRecipe, String(port)) : null;
+  // Generated faces of other agents, kept only as long as they are needed: a handful of the last
+  // speakers, dropped oldest first. Nothing here survives a restart -- the recipe comes with the
+  // message that makes the face appear, so there is nothing to keep.
+  const guestRecipes = new Map();
+  const GUEST_KEEP = 8;
   let state = { status: 'idle', text: '', agent: '' };
   const clients = new Set();
   // Sockets that asked for the chat transcript. Deliberately opt-in rather than broadcast to
@@ -316,10 +345,9 @@ function startOverlayServer({ port, onUserInput, getAgents, onFileUpload, onScre
     }
   }
   // Mixed into every broadcast instead of maintaining its own state property: the overlay hides
-  // the mic button when this value is false (i.e. for every node that didn't get an onUserInput
-  // callback -- see comment above).
+  // the mic button when this value is false (a node while its hub is reachable -- see above).
   function withMicFlag(s) {
-    return Object.assign({}, s, { micEnabled: !!onUserInput });
+    return Object.assign({}, s, { micEnabled: !!onUserInput && !!inputEnabled() });
   }
 
   function broadcast() {
@@ -336,7 +364,7 @@ function startOverlayServer({ port, onUserInput, getAgents, onFileUpload, onScre
     const bare = req.url ? req.url.split('?')[0] : '';
     const deckAsset = DECK_FILES[bare];
     if (deckAsset) { serveDeckAsset(req, res, deckAsset); return; }
-    if (bare.startsWith('/faces/')) { serveFace(req, res); return; }
+    if (bare.startsWith('/faces/')) { serveFace(req, res, ownRecipe, guestRecipes); return; }
     if (bare === '/' + USERSCRIPT_FILE) { serveUserscript(req, res); return; }
 
     // -- File drop (hub only) ------------------------------------------------------------------
@@ -422,7 +450,7 @@ function startOverlayServer({ port, onUserInput, getAgents, onFileUpload, onScre
           chatClients.add(ws);
           if (getDecisions) ws.send(JSON.stringify({ type: 'decisions', list: getDecisions() }));
         }
-        if (msg.type === 'user-input' && onUserInput && typeof msg.text === 'string' && msg.text.trim()) {
+        if (msg.type === 'user-input' && onUserInput && inputEnabled() && typeof msg.text === 'string' && msg.text.trim()) {
           // The optional agent name comes from the stage page's per-agent chat box; the microphone
           // never sets it, so spoken input keeps going through normal routing untouched -- and that
           // same difference tells the hub whether the text was typed or spoken.
@@ -481,6 +509,21 @@ function startOverlayServer({ port, onUserInput, getAgents, onFileUpload, onScre
   return {
     setState: (next) => { state = next; broadcast(); },
     getState: () => withMicFlag(state),
+    // Registers the generated face of ANOTHER agent for showing on this screen and returns the
+    // style name to use for it ('' when there is nothing usable). The recipe arrives over the
+    // network, so it is validated here exactly like this machine's own (cleanRecipe keeps only
+    // known parts and numbers in range) -- a peer picks from the catalogue, it never sends code.
+    setGuestFace: (agentName, recipe) => {
+      const slug = String(agentName || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+      if (!slug || !recipe) return '';
+      let clean;
+      try { clean = faceDesign.cleanRecipe(recipe, slug); } catch (e) { log('[overlay] unusable face recipe from ' + agentName); return ''; }
+      const style = 'guest-' + slug;
+      guestRecipes.delete(style);  // re-inserted so the most recent speaker is the last to be dropped
+      guestRecipes.set(style, clean);
+      while (guestRecipes.size > GUEST_KEEP) guestRecipes.delete(guestRecipes.keys().next().value);
+      return style;
+    },
     // One transcript line for the chat panel. Sent ONLY to sockets that subscribed, so the face
     // overlay never receives a message it would misread as state.
     pushChat: (entry) => {

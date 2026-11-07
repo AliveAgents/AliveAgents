@@ -75,7 +75,7 @@ npm install
 7. **Decide what the agent may do.** The shield button on the face page lists that machine's agent's permissions: web search, the browser, presentations, receiving files, involving other agents, the command line, and so on. Every change is confirmed in a dialog of the operating system that names exactly what changes -- Windows Hello on a PC, the fingerprint prompt on a phone (needs the Termux:API app, as the voice does). No agent and no other machine can change them, and an agent that controls the browser cannot reword what you confirm.
 8. **Updates come by themselves.** Each agent checks this repository at start and once a day. When a newer signed version exists, its face page says so; Install asks for Windows Hello or the fingerprint, naming the version, and the agent restarts once it is idle. Only versions signed with the release key on the maintainer's PC are installed -- see `publish-release.js`. Settings, keys and conversations are never touched.
 
-Talk to the hub's microphone button and the network takes it from there.
+Talk to the hub's microphone button and the network takes it from there. Away from home, a device whose hub is out of reach shows its own microphone after a few seconds -- take the phone along and talk to its agent directly; once the hub is back, the hub's microphone takes over again.
 
 ### Adding another agent
 
@@ -87,7 +87,7 @@ enroll.bat 192.168.178.90 K7QF-2M9X-BTLR ada
 
 That machine generates its own key pair locally and joins — **no private key is ever copied between machines**, and the hub picks it up without a restart. The code exists to prove the exchange is happening with the machine you're standing at rather than someone else on the network: it's mixed into a proof covering both certificates, so a relayed handshake doesn't verify. (`/provision <name>` on the hub console does the same thing without the microphone.)
 
-**A phone as a node.** An Android phone runs an agent through [Termux](https://termux.dev/), without root. Clone the repository on the phone and run `bash setup-termux.sh` once — it installs what is needed and checks that Claude Code starts and receives its prompts intact — then enroll with `node enroll.js <hub-ip> <code> <name>` and start with `bash start-node.sh`. A phone speaks with its own text-to-speech engine, so it needs no voice model.
+**A phone as a node.** An Android phone runs an agent through [Termux](https://termux.dev/), without root. Install **Termux** and **Termux:API** from [F-Droid](https://f-droid.org/) or Termux's own releases, both from the same source — **not the Play Store build**: that one carries a smaller package repository with no glibc runtime, and without it there is no Claude Code on Android (`setup-termux.sh` says so and stops). Then clone the repository on the phone and run `bash setup-termux.sh` once — it installs what is needed and checks that Claude Code starts and receives its prompts intact — then enroll with `node enroll.js <hub-ip> <code> <name>` and start with `bash start-node.sh`. A phone speaks with its own text-to-speech engine, so it needs no voice model.
 
 ## Roadmap
 

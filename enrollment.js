@@ -187,7 +187,7 @@ function derToPem(der) {
 // joining machine pick any name it liked -- including one that overwrites an existing peer's
 // certificate. The name is decided when the window is opened (by the human, through Oscar), so
 // there is no reason to let the other end choose it.
-function startEnrollmentListener({ selfName, certDir, port, host = '0.0.0.0', code, expectedName, buildConfig, onEnrolled, onClosed, log = console.log }) {
+function startEnrollmentListener({ selfName, certDir, port, host = '0.0.0.0', code, expectedName, buildConfig, onEnrolled, onClosed, onFailed, log = console.log }) {
   const fs2 = require('fs');
   const myKey = fs2.readFileSync(path.join(certDir, `${selfName}-key.pem`));
   const myCert = fs2.readFileSync(path.join(certDir, `${selfName}-cert.pem`));
@@ -260,6 +260,19 @@ function startEnrollmentListener({ selfName, certDir, port, host = '0.0.0.0', co
   });
 
   server.on('tlsClientError', (err) => log('[enroll] handshake failed: ' + err.message));
+
+  // A listener that cannot open at all -- its port taken by something else -- reports that as an event,
+  // not as an exception, and an unhandled one of those ends the whole process. Found on 2026-10-02: a
+  // helper of mine was sitting on the enrollment port, and the hub quit every time a pairing window was
+  // asked for. The caller hears about it and can tell the user instead.
+  server.on('error', (err) => {
+    const why = err.code === 'EADDRINUSE'
+      ? `port ${port} is already in use by another program on this machine`
+      : err.message;
+    log(`[enroll] the pairing window could not be opened: ${why}`);
+    close();
+    if (onFailed) onFailed(why);
+  });
 
   let closed = false;
   function close() {

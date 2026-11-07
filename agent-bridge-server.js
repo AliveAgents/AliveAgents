@@ -31,6 +31,7 @@ const permissionsLib = require('./permissions.js');
 const deviceConfirm = require('./device-confirm.js');
 const { startClaude, MESSAGE_MAX_CHARS, tooLongSentence } = require('./claude-cli.js');
 const updaterLib = require('./updater.js');
+const faceDesign = require('./face-design.js');
 const enrollmentLib = require('./enrollment.js');
 const inboxLib = require('./inbox.js');
 
@@ -81,6 +82,10 @@ const AGENT = {
   // net-config.json for the nodes, set directly here because Oscar's identity (unlike the
   // nodes') doesn't come from net-config.json, it lives here in code.
   effort: null,
+  // "opus"|"sonnet"|a full name like "claude-opus-5-5", or null for whatever the CLI is set to --
+  // same option as "model" in net-config.json for the nodes, here in code for the same reason as
+  // effort above.
+  model: null,
   // e.g. "WebSearch,WebFetch" or null -- same principle as "allowedTools" in net-config.json for
   // the nodes. Without this, these tools are forbidden by default in headless mode.
   allowedTools: null,
@@ -142,6 +147,13 @@ const busyTargets = new Set();
 // At most ONE waiting follow-up reaction per target -- a new entry overwrites an older waiting
 // one (same simplicity as elsewhere in this project), gets delivered once the target frees up.
 const pendingReactionByTarget = new Map();
+// Last line of defence against an agent that takes a question and never comes back: the node has
+// its own, shorter watchdog (node-agent.js) and normally reports its own failure, so this one only
+// catches a node that cannot even do that any more while its connection still looks fine -- a phone
+// frozen by Android's power management is exactly that case. Without it the user gets no word at
+// all, and the agent stays reserved (see targetFreed for what that blocks).
+const routeWatchdogs = new Map(); // agent name -> timer
+const ROUTE_TIMEOUT_MINUTES = 20;
 
 // Aborts ONLY the own in-flight work (claude child process, running speech) of ONE target -- for
 // a remote node that already happens locally on its own side (runTask()), so this is only
@@ -152,10 +164,31 @@ function interruptTarget(targetKey) {
   if (currentClaudeChild) { try { currentClaudeChild.kill(); } catch (e) {} currentClaudeChild = null; }
 }
 
+function clearRouteWatchdog(targetKey) {
+  const timer = routeWatchdogs.get(targetKey);
+  if (timer) { clearTimeout(timer); routeWatchdogs.delete(targetKey); }
+}
+
+// Started when a question goes out to a remote agent, cancelled the moment it answers.
+function armRouteWatchdog(agentName, requestId) {
+  clearRouteWatchdog(agentName);
+  routeWatchdogs.set(agentName, setTimeout(() => {
+    routeWatchdogs.delete(agentName);
+    // Something newer is already running there -- that request has a watchdog of its own.
+    if (activeRequestByTarget.get(agentName) !== requestId) return;
+    console.log(`[net] "${agentName}" has not answered for ${ROUTE_TIMEOUT_MINUTES} minutes -- no longer waiting for it.`);
+    activeRequestByTarget.delete(agentName);
+    targetFreed(agentName);
+    cleanupFollowUp(requestId);
+    tellUser(`${agentName} has not come back with anything for ${ROUTE_TIMEOUT_MINUTES} minutes, so I have stopped waiting. Ask again whenever you like.`);
+  }, ROUTE_TIMEOUT_MINUTES * 60000));
+}
+
 // Called once a target has finished its claude call (the text is final) -- marks the target as
 // free again and immediately delivers a possibly waiting follow-up reaction.
 function targetFreed(targetKey) {
   busyTargets.delete(targetKey);
+  clearRouteWatchdog(targetKey);
   const pending = pendingReactionByTarget.get(targetKey);
   if (pending) {
     pendingReactionByTarget.delete(targetKey);
@@ -791,6 +824,16 @@ function setOverlayState(partial) {
   const ownScreenPresentation = currentPresentation && currentPresentation.onOwnScreen ? currentPresentation : null;
   overlay.setState(Object.assign({}, partial, { faceTint: AGENT.faceTint, agentNames: [AGENT.name, ...remoteAgents.keys()], presentation: ownScreenPresentation, faceStyle: AGENT.faceStyle }));
 }
+
+// The style name under which a remote agent's face can be shown on THIS screen. An agent set up
+// from here wears a generated face ('own', see buildNodeConfig), which exists only as a recipe in
+// its own config -- so the recipe travels with the message and is registered with this machine's
+// overlay server, which serves it under a name of its own. Anything else (the hand-written faces in
+// faces/) is already on every machine and passes through unchanged.
+function faceStyleFor(agentName, faceStyle, faceRecipe) {
+  if (faceStyle !== 'own' || !faceRecipe) return faceStyle;
+  return overlay.setGuestFace(agentName, faceRecipe) || faceStyle;
+}
 setOverlayState({ status: 'idle', text: '', agent: AGENT.name });
 
 // Sets "speaking", synthesizes via Piper, and plays back locally (no browser audio needed -> no
@@ -838,6 +881,7 @@ function routeToAgent(target, userText, myRequestId) {
   // does its own normal speech need to gate via speak-request/display-go (see node-agent.js).
   const isMainDisplay = !!(mainDisplayTarget && mainDisplayTarget.nodeName === target.nodeName);
   hub.send(target.nodeName, { type: 'task', requestId: myRequestId, text: userText, isMainDisplay });
+  armRouteWatchdog(target.agentName, myRequestId);
 }
 
 // Plays a presentation on Oscar's OWN screen when he is currently the main display -- whether
@@ -1125,19 +1169,33 @@ function buildNodeConfig(name, wanted) {
     overlayPort: 8787,
     domain: wanted.domain || '',
     personality: wanted.personality || 'Direct and pragmatic, answering in 1-3 short, chat-style sentences.',
-    faceStyle: wanted.faceStyle || identity.faceStyle,
+    // Every new agent gets a face of its own, drawn from a recipe instead of one of the two hand-written
+    // shells (user's wish 2026-10-03: a new device should always turn up looking new). What the hub asked
+    // for is kept where it is a known part, the rest is drawn at random -- an agent never writes the
+    // face itself, only chooses from the parts (face-design.js). A deliberate "faceStyle" still wins,
+    // so ava and kai can still be asked for by name.
+    //
+    // The seed is fresh for every pairing rather than derived from the name alone: "always new" has to
+    // hold when the same machine is set up a second time too. The drawn recipe is then kept in the
+    // config, so that agent's face stays the same from then on.
+    faceStyle: wanted.faceStyle || 'own',
+    faceRecipe: faceDesign.cleanRecipe(wanted.faceRecipe, `${name}-${Date.now()}-${require('crypto').randomBytes(8).toString('hex')}`),
     // A colour of its own, and a voice of its own. Before this, every new agent was handed the
     // same two defaults, so the third machine to join the network turned up wearing the second
     // one's face and speaking in its voice -- nothing was broken, they simply could not be told
     // apart. normalizeTint guards the deliberate value for the same reason it guards everything
     // else on this path: a tint ends up inside a stylesheet in the overlay's privileged document.
     faceTint: normalizeTint(wanted.faceTint) || identity.faceTint,
-    androidTts: wanted.androidTts || identity.androidTts,
+    // Merged, not replaced: a phone agent set up with a bare {"language":"en"} used to lose the
+    // generated pitch and rate with it and ended up speaking in the phone's plain default voice --
+    // which is how Steve came out sounding like every other phone (found 2026-10-03). What was
+    // asked for wins per key, everything else stays the voice this agent was given.
+    androidTts: Object.assign({}, identity.androidTts, wanted.androidTts || {}),
     mainDisplay: false
   };
   // Only carried over when explicitly asked for -- these widen what the new agent may do, so they
   // should never appear by accident.
-  for (const k of ['effort', 'allowedTools', 'permissionMode', 'mcpConfig', 'chrome']) {
+  for (const k of ['effort', 'model', 'allowedTools', 'permissionMode', 'mcpConfig', 'chrome']) {
     if (wanted[k] !== undefined) cfg[k] = wanted[k];
   }
   return cfg;
@@ -1213,7 +1271,8 @@ function startProvisioning(wanted) {
         }
         if (hub) hub.addPeer(n);
       },
-      onClosed: () => { enrollment = null; }
+      onClosed: () => { enrollment = null; },
+      onFailed: (why) => tellUser(`The pairing window could not be opened: ${why}. Nothing is waiting for a new agent, so that code is void.`)
     });
   } catch (e) {
     console.error('[enroll] could not open the enrollment window:', e.message);
@@ -1312,6 +1371,7 @@ function askOscarDirectly(userText, myRequestId) {
   args.push('--append-system-prompt', buildSystemPointer({ agentName: AGENT.name, canProvision: true }));
   args.push('--output-format', 'json');
   if (AGENT.effort) args.push('--effort', AGENT.effort);
+  if (AGENT.model) args.push('--model', AGENT.model);
   // What Oscar may do comes only from his verified permissions (permissions.js), set and confirmed on
   // this machine's face page. The measured facts behind every switch -- Edit rules, Skill, the shell
   // being blocked by name -- are recorded next to claudePermissionArgs. Read access needs no grant
@@ -1802,6 +1862,8 @@ function askAgent(userText, targetAgent = null, source = 'console') {
     lastRoutedTarget = null; // a deliberate restart should no longer "stick" to the last agent
     followUpQueues.clear(); originalQuestionByRequest.clear(); lastAnswerByRequest.clear(); chainLengthByRequest.clear();
     activeRequestByTarget.clear(); busyTargets.clear(); pendingReactionByTarget.clear(); displayQueue.length = 0;
+    for (const timer of routeWatchdogs.values()) clearTimeout(timer);
+    routeWatchdogs.clear();
     currentPresentation = null; presentationOwnerRequestId = null; presentationRelays.clear();
     if (hub) hub.broadcast({ type: 'reset' }); // reset remote agents too (including clear-presentation there, see node-agent.js)
     console.log('Conversation reset. The next message starts a new session.');
@@ -1973,6 +2035,19 @@ if (netConfig) {
         peers: netConfig.peers || [],
         port: NET_PORT,
         onPeerDown: (nodeName) => {
+          // Whatever was asked of this machine will never be answered now, so its reservation goes
+          // with it. Without this the agent stayed in busyTargets for good: a follow-up reaction
+          // meant for it waited forever (advanceFollowUpQueue), and its name or responsibility could
+          // not be changed any more (agentIsBusy). Found 2026-10-11 while looking into a phone agent
+          // that had gone quiet.
+          for (const [agentName, info] of remoteAgents) {
+            if (info.nodeName !== nodeName) continue;
+            if (busyTargets.has(agentName)) console.log(`[net] "${agentName}" went offline while still working on something -- that request is given up on.`);
+            busyTargets.delete(agentName);
+            activeRequestByTarget.delete(agentName);
+            // A reaction held back for this agent cannot be delivered to it any more either.
+            pendingReactionByTarget.delete(agentName);
+          }
           for (const [agentName, info] of remoteAgents) if (info.nodeName === nodeName) remoteAgents.delete(agentName);
           lastHello.delete(nodeName);
           // A deck that went to this node will never be reported finished now.
@@ -2081,7 +2156,7 @@ if (netConfig) {
                   for (const s of segments) fs.unlink(s.filePath, () => {});
                   return;
                 }
-                playPresentationLocally(segments, msg.agentName, msg.url, text, msg.requestId, suggestedNext, msg.faceStyle, msg.faceTint, page);
+                playPresentationLocally(segments, msg.agentName, msg.url, text, msg.requestId, suggestedNext, faceStyleFor(msg.agentName, msg.faceStyle, msg.faceRecipe), msg.faceTint, page);
               });
             } else {
               const deliver = () => {
@@ -2094,7 +2169,9 @@ if (netConfig) {
                   // sending node may be an older build that only set audioBase64, and the display
                   // node should get one consistent shape either way.
                   hub.send(mainDisplayTarget.nodeName, {
-                    type: 'present', requestId: msg.requestId, agentName: msg.agentName, url: page ? '' : msg.url, page: page || undefined, text, faceStyle: msg.faceStyle, faceTint: msg.faceTint,
+                    // faceRecipe relayed as it came: the display node needs the recipe itself, a name
+                    // this machine made up for its own use would mean nothing there.
+                    type: 'present', requestId: msg.requestId, agentName: msg.agentName, url: page ? '' : msg.url, page: page || undefined, text, faceStyle: msg.faceStyle, faceTint: msg.faceTint, faceRecipe: msg.faceRecipe,
                     segments: wireSegments,
                     audioBase64: wireSegments.length === 1 ? wireSegments[0].audioBase64 : undefined
                   });
@@ -2125,10 +2202,10 @@ if (netConfig) {
           if (msg.type === 'speak-request' && typeof msg.agentName === 'string') {
             const deliver = () => {
               if (currentPresentation && msg.requestId === presentationOwnerRequestId) {
-                currentPresentation = Object.assign({}, currentPresentation, { agentName: msg.agentName, faceStyle: msg.faceStyle, faceTint: normalizeTint(msg.faceTint) });
+                currentPresentation = Object.assign({}, currentPresentation, { agentName: msg.agentName, faceStyle: faceStyleFor(msg.agentName, msg.faceStyle, msg.faceRecipe), faceTint: normalizeTint(msg.faceTint) });
               }
               try {
-                hub.send(nodeName, { type: 'display-go', requestId: msg.requestId, updatePresentationSpeaker: !!currentPresentation, agentName: msg.agentName, faceStyle: msg.faceStyle, faceTint: msg.faceTint });
+                hub.send(nodeName, { type: 'display-go', requestId: msg.requestId, updatePresentationSpeaker: !!currentPresentation, agentName: msg.agentName, faceStyle: msg.faceStyle, faceTint: msg.faceTint, faceRecipe: msg.faceRecipe });
               } catch (e) {}
             };
             const isDisplayTarget = mainDisplayTarget && mainDisplayTarget.nodeName === nodeName;

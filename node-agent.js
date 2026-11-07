@@ -99,8 +99,24 @@ const speaker = createSpeaker({
   androidTts: config.androidTts
 });
 
-// Own overlay (face) on this machine. NO onUserInput here -- only Oscar distributes tasks by
-// microphone, this node only reacts to tasks coming from the hub.
+// Talking to this agent directly, on its own device, while the hub is out of reach (user's wish,
+// 2026-09-22: take the phone along, leave everything else at home). While the hub is reachable it stays
+// the one microphone of the network and this device takes tasks only from it. The microphone appears
+// only after the hub has been gone for OFFLINE_AFTER_MS, so a hub that is merely reconnecting does not
+// make one flicker onto the page; it goes the moment the hub is back. See hubReachable below.
+const OFFLINE_AFTER_MS = 10000;
+let hubUp = false;
+let localInput = false;
+let offlineTimer = null;
+
+// How long one turn may take before this agent gives up on it and says so (see the watchdog in
+// runTask). "taskTimeoutMinutes" in net-config.json overrides it, 0 switches it off entirely --
+// off means a stuck turn silences the agent for good, so switch it off only with a reason.
+const TASK_TIMEOUT_MINUTES = Number.isFinite(Number(config.taskTimeoutMinutes)) ? Math.max(0, Number(config.taskTimeoutMinutes)) : 15;
+const TASK_TIMEOUT_MS = TASK_TIMEOUT_MINUTES * 60000;
+
+// Own overlay (face) on this machine. Its microphone and typed input reach handleLocalInput only while
+// localInput is on -- overlay-server.js checks inputEnabled on every message, not just the button.
 const OVERLAY_PORT = config.overlayPort || 8787;
 // The class of the screen this agent's face page is shown on, or null (see normalizeScreen in
 // overlay-server.js). It changes when a browser on this machine opens or closes the page -- not when
@@ -108,6 +124,10 @@ const OVERLAY_PORT = config.overlayPort || 8787;
 let myScreen = null;
 const overlay = startOverlayServer({
   port: OVERLAY_PORT,
+  onUserInput: (text, agent, source) => handleLocalInput(text, source),
+  inputEnabled: () => localInput,
+  // This agent's own face, drawn from the recipe it was given when it was set up (face-design.js).
+  faceRecipe: config.faceRecipe || null,
   // This device's own permissions page. permissionStore is created further down; nothing can ask
   // before the module has finished loading.
   onPageMessage: (msg, reply) => (updaterLib.PAGE_MESSAGE_TYPES.includes(msg.type)
@@ -131,6 +151,18 @@ let currentPresentation = null;
 // configuration mistake, not a runtime condition, and normalizeTint returns null for anything it
 // does not fully trust -- at which point the face simply keeps its own built-in colours.
 const FACE_TINT = normalizeTint(config.faceTint);
+// Sent along whenever this agent's face is to appear on ANOTHER machine's screen: a generated face
+// lives only as a recipe in this machine's own config, so the screen showing it has no way to look it
+// up. undefined for an agent wearing one of the hand-written faces -- those exist everywhere.
+const OWN_FACE_RECIPE = config.faceStyle === 'own' && config.faceRecipe ? config.faceRecipe : undefined;
+
+// The style name under which another agent's face can be shown HERE. A generated face ('own') only
+// means something on the machine it belongs to, so the recipe that came with the message is
+// registered with this machine's overlay server, which then serves it under a name of its own.
+function faceStyleFor(agentName, faceStyle, faceRecipe) {
+  if (faceStyle !== 'own' || !faceRecipe) return faceStyle;
+  return overlay.setGuestFace(agentName, faceRecipe) || faceStyle;
+}
 
 function setOverlayState(partial) {
   // config.faceStyle || '' instead of borrowing some concrete default value: a node with no
@@ -435,7 +467,7 @@ function playAndReport(segments, text, myRequestId, hubRequestId, suggestedNext 
     };
     if (isMainDisplay && hubRequestId !== undefined) {
       pendingDisplayGo.set(hubRequestId, { segments, resume: playNow });
-      link.send({ type: 'speak-request', requestId: hubRequestId, agentName: AGENT.name, faceStyle: config.faceStyle || '', faceTint: FACE_TINT });
+      link.send({ type: 'speak-request', requestId: hubRequestId, agentName: AGENT.name, faceStyle: config.faceStyle || '', faceTint: FACE_TINT, faceRecipe: OWN_FACE_RECIPE });
     } else {
       playNow();
     }
@@ -535,7 +567,7 @@ function sayWithPresentation(slideTexts, myRequestId, hubRequestId, url, suggest
       // audioBase64 only for the single-slide case -- see the same spot in agent-bridge-server.js
       // (costs nothing there, keeps an older hub working, and would only bloat a multi-slide deck).
       const sent = link.send({
-        type: 'present-request', requestId: hubRequestId, agentName: AGENT.name, url: page ? '' : url, page: page || undefined, text, suggestedNext, faceStyle: config.faceStyle || '', faceTint: FACE_TINT,
+        type: 'present-request', requestId: hubRequestId, agentName: AGENT.name, url: page ? '' : url, page: page || undefined, text, suggestedNext, faceStyle: config.faceStyle || '', faceTint: FACE_TINT, faceRecipe: OWN_FACE_RECIPE,
         segments: wireSegments,
         audioBase64: wireSegments.length === 1 ? wireSegments[0].audioBase64 : undefined
       });
@@ -556,7 +588,26 @@ function sayWithPresentation(slideTexts, myRequestId, hubRequestId, url, suggest
   });
 }
 
-function runTask(userText, myRequestId, hubRequestId, isMainDisplay = false) {
+// What this agent says when the CLI exits with an error. "Something went wrong on my end" was all it
+// ever said, which is true and useless: the three failures that actually happen have very different
+// answers, and the user hears this sentence instead of reading a log. Matched against the CLI's own
+// wording, never echoed: its output is not something to read aloud unseen.
+function describeCliFailure(errOut, out) {
+  const text = `${errOut || ''} ${out || ''}`.toLowerCase();
+  if (text.includes('usage limit') || text.includes('rate limit') || text.includes('too many requests')) {
+    return 'I have hit the usage limit on my account, so I cannot answer until it resets.';
+  }
+  if (text.includes('not logged in') || text.includes('/login') || text.includes('authentication')) {
+    return 'I am not logged in on this machine any more, so I cannot answer until that is sorted out.';
+  }
+  if (text.includes('model') && (text.includes('not found') || text.includes('not available') || text.includes('does not exist'))) {
+    return 'The model I am set to use is not available to me right now.';
+  }
+  return 'Something went wrong on my end.';
+}
+
+// options.direct: the user spoke to this device itself, the hub being out of reach (handleLocalInput).
+function runTask(userText, myRequestId, hubRequestId, isMainDisplay = false, options = {}) {
   // The hub turns such a text away already (askAgent); this covers a hub from before that check.
   if (String(userText).length > MESSAGE_MAX_CHARS) {
     say('That message is too long for me. Please send it as a file instead.', myRequestId, hubRequestId, [], isMainDisplay);
@@ -579,7 +630,11 @@ function runTask(userText, myRequestId, hubRequestId, isMainDisplay = false) {
   rosterAtLastTurn = rosterNow;
   const inboxEvent = inboxLib.buildInboxEvent(inboxLib.listInbox(__dirname), newInboxFiles);
   newInboxFiles.clear();
-  const events = `${identityEvent} ${identityNotice} ${rosterEvent} ${inboxEvent}`.trim();
+  // Without it the agent would promise to pass things on to agents it cannot reach.
+  const directEvent = options.direct
+    ? 'The hub is out of reach right now, so the user is talking to you directly on this device. No other agent can be reached: answer yourself, and do not offer to pass anything on.'
+    : '';
+  const events = `${identityEvent} ${identityNotice} ${rosterEvent} ${inboxEvent} ${directEvent}`.trim();
   identityNotice = '';
 
   // The message goes in on stdin (claude-cli.js), so it may be as long as it likes and keeps its line
@@ -598,6 +653,11 @@ function runTask(userText, myRequestId, hubRequestId, isMainDisplay = false) {
   // Applies per call (like --output-format), not just on the first turn -- so it's appended here
   // centrally, regardless of whether this is a fresh or resumed session.
   if (config.effort) args.push('--effort', config.effort);
+  // Optional per agent in net-config.json: "model": "opus" | "sonnet" | a full name like
+  // "claude-opus-5-5". Omitted = whatever the CLI on this machine is set to. Per agent rather than
+  // per network on purpose: a phone agent minding a game server and a laptop agent writing code do
+  // not need the same model, and the phone is the one paying for every token in battery.
+  if (config.model) args.push('--model', config.model);
   // What this agent may do comes only from its verified permissions (permissions.js), set and confirmed
   // on this device's face page. The measured facts behind every switch are recorded there.
   // An mcpConfig file name is resolved against THIS folder, not the working directory: it lives next to
@@ -632,7 +692,25 @@ function runTask(userText, myRequestId, hubRequestId, isMainDisplay = false) {
   child.stdout.on('data', (d) => { out += d.toString(); });
   child.stderr.on('data', (d) => { errOut += d.toString(); });
 
+  // A turn that never ends leaves this agent silent AND, at the hub, reserved forever: a routed
+  // agent stays in busyTargets until its answer arrives (agent-bridge-server.js), so every later
+  // question to it is held back as well. One stuck turn therefore looks exactly like a dead agent --
+  // which is how this was found on 2026-10-11, with the phone online, connected, and mute.
+  // The cap is deliberately generous, because real work (shell, several tool rounds, a high effort
+  // level) does take minutes; it only has to be shorter than a person's patience.
+  let timedOut = false;
+  const watchdog = TASK_TIMEOUT_MS > 0 ? setTimeout(() => {
+    timedOut = true;
+    if (currentClaudeChild === child) currentClaudeChild = null;
+    console.error(`[${AGENT.name}] No reply after ${TASK_TIMEOUT_MINUTES} minutes -- stopping this turn. Last error output: ${errOut.trim().slice(-400) || '(none)'}`);
+    try { child.kill(); } catch (e) { /* already gone */ }
+    if (myRequestId !== requestId) return;
+    // Spoken rather than only logged: this sentence is also what frees the agent again at the hub.
+    say(`I got stuck on that one and stopped after ${TASK_TIMEOUT_MINUTES} minutes. Ask me again, and if it keeps happening something on my machine needs a look.`, myRequestId, hubRequestId, [], isMainDisplay);
+  }, TASK_TIMEOUT_MS) : null;
+
   child.on('error', (err) => {
+    if (watchdog) clearTimeout(watchdog);
     if (currentClaudeChild === child) currentClaudeChild = null;
     if (myRequestId !== requestId) return;
     console.error('Could not start "claude":', err.message);
@@ -640,11 +718,13 @@ function runTask(userText, myRequestId, hubRequestId, isMainDisplay = false) {
   });
 
   child.on('close', (code) => {
+    if (watchdog) clearTimeout(watchdog);
     if (currentClaudeChild === child) currentClaudeChild = null;
+    if (timedOut) return; // the watchdog killed it and has already spoken
     if (myRequestId !== requestId) return;
     if (code !== 0) {
       console.error('claude CLI error:', errOut);
-      say('Something went wrong on my end.', myRequestId, hubRequestId, [], isMainDisplay);
+      say(describeCliFailure(errOut, out), myRequestId, hubRequestId, [], isMainDisplay);
       return;
     }
     let text = '';
@@ -690,7 +770,8 @@ function runTask(userText, myRequestId, hubRequestId, isMainDisplay = false) {
     console.log(`[${AGENT.name}] Presentation marker: ${presentationUrl ? presentationLabel(presentationUrl) : '(none)'}${slideSegments.length > 1 ? `, ${slideSegments.length} slides` : ''}`);
     if (presentationUrl && !turnPermissions.presentations) console.log(`[${AGENT.name}] Not presenting ${presentationLabel(presentationUrl)} -- switched off in this agent's permissions.`);
     const presenting = presentationUrl && turnPermissions.presentations;
-    if (presenting && knownMainDisplay) {
+    // A main display is only reachable through the hub; without it, the agent's own screen.
+    if (presenting && knownMainDisplay && hubUp) {
       sayWithPresentation(slideSegments, myRequestId, hubRequestId, presentationUrl, suggested, isMainDisplay);
       return;
     }
@@ -742,6 +823,62 @@ function adoptIdentity(you) {
   setOverlayState({ status: prev.status, text: prev.text, agent: AGENT.name });
 }
 
+// Whether the hub is reachable, from the link's own open and close events. Going offline is acted on only
+// after OFFLINE_AFTER_MS without a connection -- the link retries every few seconds and reports every
+// failed attempt, so the count starts at the first one and is not restarted. Coming back counts at once.
+function hubReachable(up) {
+  if (up) {
+    hubUp = true;
+    clearTimeout(offlineTimer);
+    offlineTimer = null;
+    setLocalInput(false);
+    return;
+  }
+  hubUp = false;
+  if (localInput || offlineTimer) return;
+  offlineTimer = setTimeout(() => {
+    offlineTimer = null;
+    if (!hubUp) setLocalInput(true);
+  }, OFFLINE_AFTER_MS);
+}
+
+function setLocalInput(on) {
+  if (localInput === on) return;
+  localInput = on;
+  if (on) {
+    // Nobody is reachable now, and the skills' data files say so instead of listing the agents and the
+    // main display from before. The hub's next peers message puts them back.
+    knownPeers = [];
+    // A main display is only reachable through the hub: it counts as offline, and presentations go to
+    // this device's own screen (display.md says so, and runTask sends none to the hub).
+    knownMainDisplayOffline = knownMainDisplay || knownMainDisplayOffline;
+    knownMainDisplay = null;
+    refreshSkillData();
+  }
+  console.log(on
+    ? `[${AGENT.name}] The hub is out of reach -- this device's own microphone is on (face page).`
+    : `[${AGENT.name}] The hub is reachable again -- input goes through it, this device's microphone is off.`);
+  // Re-sent unchanged, so the face page learns about the microphone at once (micEnabled, overlay-server.js).
+  const prev = overlay.getState();
+  setOverlayState({ status: prev.status, text: prev.text, agent: prev.agent || AGENT.name });
+}
+
+// Speech from this device's own face page -- only ever while the hub is out of reach (overlay-server.js
+// asks inputEnabled first, and this checks again). From here on it is a task like one from the hub, minus
+// the hub: nothing is reported, nothing handed on, and the agent is told so (runTask, options.direct).
+function handleLocalInput(text, source) {
+  if (!localInput) return;
+  const myRequestId = ++requestId;
+  console.log(`[${AGENT.name}] Heard directly on this device (${source}): ${text}`);
+  // A new request takes the previous deck off the screen, as a new input at the hub does.
+  currentPresentation = null;
+  runTask(text, myRequestId, undefined, false, { direct: true });
+}
+
+// Counting starts now: a device that never finds its hub -- a phone taken along -- offers its own
+// microphone after OFFLINE_AFTER_MS.
+hubReachable(false);
+
 const link = connectToHub({
   selfName: config.self,
   hubName: config.hubName,
@@ -752,7 +889,12 @@ const link = connectToHub({
   // for the actual, low-effort way to reassign the role while running.
   // agentName and domain are only this machine's introduction: the hub decides who it is (admitNode in
   // agent-bridge-server.js) and says so in its peers message, as "you".
-  onOpen: () => link.send({ type: 'hello', agentName: AGENT.name, domain: ownDomain, mainDisplay: !!config.mainDisplay, screen: myScreen }),
+  onOpen: () => {
+    hubReachable(true);
+    link.send({ type: 'hello', agentName: AGENT.name, domain: ownDomain, mainDisplay: !!config.mainDisplay, screen: myScreen });
+  },
+  // Also after every failed attempt while the hub is away -- hubReachable counts from the first one.
+  onClose: () => hubReachable(false),
   onMessage: (msg) => {
     if (msg.type === 'task' && typeof msg.text === 'string') {
       const myRequestId = ++requestId; // own, local counter -- independent of the hub
@@ -815,7 +957,7 @@ const link = connectToHub({
       if (!pending) return; // not (or no longer) what's being waited on
       pendingDisplayGo.delete(msg.requestId);
       if (msg.updatePresentationSpeaker && currentPresentation) {
-        currentPresentation = Object.assign({}, currentPresentation, { agentName: msg.agentName, faceStyle: msg.faceStyle, faceTint: normalizeTint(msg.faceTint) });
+        currentPresentation = Object.assign({}, currentPresentation, { agentName: msg.agentName, faceStyle: faceStyleFor(msg.agentName, msg.faceStyle, msg.faceRecipe), faceTint: normalizeTint(msg.faceTint) });
       }
       pending.resume();
     }
@@ -881,7 +1023,7 @@ const link = connectToHub({
           for (const s of segments) fs.unlink(s.filePath, () => {});
           return;
         }
-        currentPresentation = { agentName: msg.agentName, url: (page && overlay.showPage(page)) || msg.url, faceStyle: msg.faceStyle, faceTint: normalizeTint(msg.faceTint), slide: 0 };
+        currentPresentation = { agentName: msg.agentName, url: (page && overlay.showPage(page)) || msg.url, faceStyle: faceStyleFor(msg.agentName, msg.faceStyle, msg.faceRecipe), faceTint: normalizeTint(msg.faceTint), slide: 0 };
         setOverlayState({ status: 'speaking', text: segments[0].text || msg.text || '', agent: AGENT.name });
         speaker.playSequence(segments.map((s) => s.filePath), (index) => {
           // Runs in the pause BEFORE each segment (see playSequence in speech.js) -- slide 0 is

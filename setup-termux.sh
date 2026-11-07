@@ -21,6 +21,13 @@ die()  { printf '\n   FAILED: %s\n\n' "$1" >&2; exit 1; }
 
 [ -n "${PREFIX:-}" ] || die "PREFIX is not set -- this script is for Termux on Android, nothing else."
 [ "$(uname -m)" = "aarch64" ] || die "This phone reports $(uname -m); only aarch64 is supported."
+# Termux from the Play Store is a separate build with its own, smaller package repository
+# (termux.net). It has no glibc-repo, and without the glibc runtime there is no Claude Code on Android
+# (see the step further down). Caught here instead of halfway through several hundred megabytes of
+# downloads, which is where a phone ran into it on 2026-10-02.
+case "${TERMUX_VERSION:-}" in
+  *googleplay*) die "This is Termux from the Play Store, whose package sources have no glibc runtime -- Claude Code cannot run on it. Install Termux and Termux:API from F-Droid (f-droid.org), both from the same source, and run this again." ;;
+esac
 
 step "Keeping the phone awake"
 # Android suspends background processes once the screen goes off, which silently kills an agent a
@@ -42,7 +49,20 @@ for p in nodejs openssl-tool termux-api; do
   fi
 done
 command -v node >/dev/null 2>&1 || die "node is still not on PATH"
-ok "node $(node -v), npm $(npm -v), $(openssl version)"
+# Run it, do not just find it. A Termux whose package set has drifted installs a node that links
+# against an ICU version the phone does not have, and it dies on every start with
+# 'CANNOT LINK EXECUTABLE "node": library "libicui18n.so.NN" not found'. The file is there, so a
+# command -v check passes happily -- and the next steps then fail with something that reads like a
+# network problem (measured on a new phone, 2026-11-07: "npm pack failed -- is the phone online?"
+# while the phone was perfectly online).
+NODE_V="$(node -v 2>/dev/null || true)"
+case "$NODE_V" in
+  v*) ;;
+  *) die "node is installed but cannot start -- see the 'CANNOT LINK EXECUTABLE' line above. Its package set is out of step with itself. Run 'pkg upgrade -y' (accept the defaults it offers), check that 'node -v' prints a version, and start this script again. If it still fails, 'termux-change-repo', pick a different mirror, then 'pkg update && pkg upgrade -y'." ;;
+esac
+NPM_V="$(npm -v 2>/dev/null || true)"
+[ -n "$NPM_V" ] || die "npm does not run although node does. Try 'pkg install --reinstall nodejs', then run this script again."
+ok "node $NODE_V, npm $NPM_V, $(openssl version)"
 
 step "Audio player for presentations"
 # Optional. When this phone is the main display, other agents’ presentations arrive as their own
@@ -65,7 +85,7 @@ step "glibc runtime"
 if [ -f "$GLIBC/lib/ld-linux-aarch64.so.1" ]; then
   ok "glibc runtime already present"
 else
-  dpkg -s glibc-repo >/dev/null 2>&1 || { info "adding glibc repository"; pkg install -y glibc-repo >/dev/null 2>&1 || die "could not add glibc-repo"; }
+  dpkg -s glibc-repo >/dev/null 2>&1 || { info "adding glibc repository"; pkg install -y glibc-repo >/dev/null 2>&1 || die "could not add glibc-repo. If this Termux came from the Play Store, that is why: its package sources do not have it. Install Termux and Termux:API from F-Droid instead. Otherwise try 'apt update && apt full-upgrade' first."; }
   info "updating package lists"
   apt-get update >/dev/null 2>&1
   info "installing glibc-runner (a few hundred MB, be patient)"
@@ -80,7 +100,10 @@ if [ -x "$NATIVE" ]; then
 else
   WORK="$(mktemp -d "${TMPDIR:-/tmp}/claude-fetch.XXXXXX")" || die "could not create a temp directory"
   info "downloading the glibc arm64 build (~220 MB)"
-  ( cd "$WORK" && npm pack @anthropic-ai/claude-code-linux-arm64 >/dev/null 2>&1 ) || { rm -rf "$WORK"; die "npm pack failed -- is the phone online?"; }
+  # The error is kept, not thrown away: "is the phone online?" was the only thing this said, and on a
+  # phone that was online it sent the search in exactly the wrong direction (2026-11-07).
+  PACK_ERR="$( cd "$WORK" && npm pack @anthropic-ai/claude-code-linux-arm64 2>&1 >/dev/null )" \
+    || { rm -rf "$WORK"; die "could not download the Claude Code package. npm said: $(printf '%s' "$PACK_ERR" | tail -3 | tr '\n' ' ')"; }
   ( cd "$WORK" && tar xzf ./*.tgz ) || { rm -rf "$WORK"; die "could not unpack the download"; }
   [ -f "$WORK/package/claude" ] || { rm -rf "$WORK"; die "the package did not contain a claude binary"; }
   mkdir -p "$(dirname "$NATIVE")"
@@ -98,19 +121,54 @@ step "claude launcher"
 # through grun and as "42" through this launcher. So the two things grun does that actually matter
 # are done directly below.
 #
-# LD_PRELOAD is passed per command via env and deliberately NOT exported: exported, it leaks into
-# every bionic child process in the same shell and breaks them, down to a plain "tail" dying with
-# 'library "libc.so.6" not found'.
-cat > "$WRAPPER" <<'WRAPEOF'
+# The glibc exec shim goes to the loader as --preload, never as LD_PRELOAD. In the environment it
+# stays there for the whole claude process and is inherited by every command claude runs: those are
+# bionic programs, they cannot load a glibc library, and each one dies with
+# 'library "libc.so.6" not found'. Measured on a phone on 2026-10-03, where the agent reported that
+# its shell was broken and a plain "ls" was enough to reproduce it. --preload applies the shim to
+# claude alone. The shells claude then starts carry no preload at all, which would cost them
+# Termux's own exec shim, so SHELL_INIT puts that one back for them.
+SHELL_INIT="${PREFIX:-/data/data/com.termux/files/usr}/etc/claude-shell-init.sh"
+cat > "$SHELL_INIT" <<'INITEOF'
+# Generated by setup-termux.sh. Every non-interactive bash that Claude Code starts reads this file
+# (BASH_ENV, set in the claude launcher) and gets Termux's own exec shim back -- the launcher has to
+# clear LD_PRELOAD so that the glibc shim does not reach bionic programs.
+TERMUX_EXEC="${PREFIX:-/data/data/com.termux/files/usr}/lib/libtermux-exec-ld-preload.so"
+if [ -z "${LD_PRELOAD:-}" ] && [ -f "$TERMUX_EXEC" ]; then
+  export LD_PRELOAD="$TERMUX_EXEC"
+fi
+unset TERMUX_EXEC
+INITEOF
+if "$GLIBC/lib/ld-linux-aarch64.so.1" --help 2>&1 | grep -q -- '--preload'; then
+  cat > "$WRAPPER" <<WRAPEOF
 #!/data/data/com.termux/files/usr/bin/bash
-# Generated by setup-termux.sh -- see the comments there for why this does not call grun.
+# Generated by setup-termux.sh -- see the comments there for why this does not call grun, and why
+# the exec shim is handed to the loader instead of being put into the environment.
+GLIBC="\${PREFIX:-/data/data/com.termux/files/usr}/glibc"
+export BASH_ENV="$SHELL_INIT"
+exec env -u LD_PRELOAD \\
+  "\$GLIBC/lib/ld-linux-aarch64.so.1" --preload "\$GLIBC/lib/libtermux-exec.so" \\
+  --library-path "\$GLIBC/lib" \\
+  "\$HOME/claude-native/claude" "\$@"
+WRAPEOF
+  chmod +x "$WRAPPER" || die "could not write $WRAPPER"
+  ok "written to $WRAPPER"
+else
+  # glibc older than 2.30 has no --preload, so the shim can only go through the environment and
+  # every shell command inside claude will fail. Written anyway, with the cure spelled out.
+  cat > "$WRAPPER" <<'WRAPEOF'
+#!/data/data/com.termux/files/usr/bin/bash
+# Generated by setup-termux.sh -- fallback form for a glibc loader without --preload.
 GLIBC="${PREFIX:-/data/data/com.termux/files/usr}/glibc"
 exec env LD_PRELOAD="$GLIBC/lib/libtermux-exec.so" \
   "$GLIBC/lib/ld-linux-aarch64.so.1" --library-path "$GLIBC/lib" \
   "$HOME/claude-native/claude" "$@"
 WRAPEOF
-chmod +x "$WRAPPER" || die "could not write $WRAPPER"
-ok "written to $WRAPPER"
+  chmod +x "$WRAPPER" || die "could not write $WRAPPER"
+  ok "written to $WRAPPER"
+  info "this glibc loader has no --preload, so shell commands inside claude will fail with"
+  info "'library libc.so.6 not found'. Fix: pkg upgrade glibc-runner, then run this script again."
+fi
 
 step "Verifying the launcher passes arguments intact"
 # The one failure this whole file exists to prevent, checked rather than assumed: a launcher that
@@ -122,7 +180,17 @@ case "$VER" in
 esac
 PROBE="$("$WRAPPER" -p 'Reply with exactly the word ARGUMENTS-INTACT and nothing else.' < /dev/null 2>&1 | tail -1)" || true
 case "$PROBE" in
-  *ARGUMENTS-INTACT*) ok "multi-word prompts arrive whole" ;;
+  *ARGUMENTS-INTACT*)
+    ok "multi-word prompts arrive whole"
+    # The other failure that looks healthy from outside: claude itself starts, every command it
+    # runs dies on the inherited preload. Only visible from inside, so ask it to run one.
+    SHELL_PROBE="$("$WRAPPER" -p 'Run this shell command and reply with its output only: echo SHELL-WORKS' \
+      --allowedTools Bash --permission-mode bypassPermissions < /dev/null 2>&1 | tail -3)" || true
+    case "$SHELL_PROBE" in
+      *SHELL-WORKS*) ok "shell commands inside claude work" ;;
+      *libc.so.6*) die "claude starts, but every shell command inside it fails: $SHELL_PROBE" ;;
+      *) info "shell commands inside claude could not be confirmed: $SHELL_PROBE" ;;
+    esac ;;
   *"not logged in"*|*"Not logged in"*|*"/login"*)
     info "not logged in yet, so the argument check could not run"
     info "run 'claude' once, log in, then run this script again to confirm" ;;

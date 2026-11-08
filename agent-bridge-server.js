@@ -760,7 +760,7 @@ const updater = updaterLib.createUpdater({
   root: __dirname, agentName: AGENT.name, confirmer,
   isIdle: () => busyTargets.size === 0 && !currentPresentation && !currentClaudeChild,
   onChange: (update) => overlay.pushPage({ type: 'update', update }),
-  autoUpdate: config.autoUpdate === true
+  autoUpdate: !!(netConfig && netConfig.autoUpdate === true)
 });
 updater.start();
 

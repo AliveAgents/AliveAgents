@@ -147,7 +147,7 @@ function createUpdater({ root, agentName, confirmer, isIdle = () => true, onChan
 
   function publicState() {
     return {
-      status: state.status, problem: state.problem, agentName: nameNow(), installed: installedVersion(),
+      status: state.status, problem: state.problem, agentName: nameNow(), installed: installedVersion(), root,
       latest: state.latest ? { version: state.latest.version, published: state.latest.published } : null,
       changedCount: state.changed.length, manual: state.manual.slice(), restartable, checkedAt: state.checkedAt
     };
@@ -173,7 +173,6 @@ function createUpdater({ root, agentName, confirmer, isIdle = () => true, onChan
 
   // What changed since the installed version, if anything newer is published.
   async function check() {
-    if (managedByGit) { set({ status: 'git', problem: 'This copy is managed with git, so it does not update itself.' }); return publicState(); }
     if (busy) return publicState();
     busy = true;
     try {
@@ -204,6 +203,16 @@ function createUpdater({ root, agentName, confirmer, isIdle = () => true, onChan
       // A start script that does not exist here is not running here either, so it can simply be written --
       // start-node.sh on Windows, the .bat files on a phone. Only one that is there waits for a hand.
       const manual = changed.filter((rel) => isManual(rel) && fs.existsSync(path.join(root, rel)));
+      // A copy with a .git folder still gets TOLD -- it just does not install anything itself. Until
+      // 2026-11-07 it did not even look, and since every phone is set up by cloning the repository,
+      // that silently covered every agent on the network: Steve sat five weeks on an old version while
+      // his face page said nothing at all. Checking is free and harmless; writing over a working copy
+      // someone is editing is what the rule was there to prevent, and that part stays.
+      if (managedByGit) {
+        set({ status: 'git-update', problem: 'This copy is managed with git, so it does not update itself.', latest: manifest, commit, changed, manual, checkedAt: now });
+        log(`[update] Version ${manifest.version} is out (${changed.length} files). This copy is managed with git: "git pull" in ${root}, then restart.`);
+        return publicState();
+      }
       set({ status: manual.length ? 'manual' : 'available', problem: null, latest: manifest, commit, changed, manual, checkedAt: now });
       log(`[update] Version ${manifest.version} is available (${changed.length} files${manual.length ? `, needs a manual install: ${manual.join(', ')}` : ''}).`);
       return publicState();
@@ -294,7 +303,7 @@ function createUpdater({ root, agentName, confirmer, isIdle = () => true, onChan
   }
 
   function start() {
-    if (managedByGit) { log('[update] This copy is managed with git, so it does not update itself.'); return; }
+    if (managedByGit) log('[update] This copy is managed with git: new versions are reported, not installed.');
     timers.push(setTimeout(() => { check(); }, FIRST_CHECK_MS));
     const daily = setInterval(() => { check(); }, CHECK_EVERY_MS);
     timers.push(daily);

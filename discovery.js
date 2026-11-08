@@ -129,4 +129,39 @@ function listenForHub({ hubName, expectedFp, currentHost, onFound, log = console
   };
 }
 
-module.exports = { startHubBeacon, listenForHub, DISCOVERY_PORT, BEACON_MS };
+// -- Before a machine belongs anywhere ----------------------------------------------------------
+// A machine that has not been paired yet knows no hub name and holds no certificate, so it cannot
+// use listenForHub above: it has nothing to compare against. It listens for ANY hub instead, purely
+// to offer the address as a suggestion on its join page (join-mode.js) -- the user still sees it,
+// and the pairing code is what decides whether the two machines end up trusting each other. A
+// forged beacon can therefore only propose the wrong address, which fails the code check moments
+// later; it cannot talk its way into a network.
+function listenForAnyHub({ onFound, log = console.log }) {
+  const socket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+  let stopped = false;
+
+  socket.on('error', () => { try { socket.close(); } catch (e) {} });
+  socket.on('message', (msg, rinfo) => {
+    let m;
+    try { m = JSON.parse(msg.toString('utf8')); } catch (e) { return; }
+    if (!m || m.magic !== MAGIC || m.probe) return;
+    if (typeof m.hubName !== 'string' || !m.hubName) return;
+    onFound({ hubName: m.hubName, host: rinfo.address, port: Number(m.port) || undefined });
+  });
+
+  socket.bind(DISCOVERY_PORT, () => {
+    try { socket.setBroadcast(true); } catch (e) {}
+    log(`[discovery] listening for any hub on udp/${DISCOVERY_PORT}`);
+    probe();
+  });
+
+  function probe() {
+    if (stopped) return;
+    try { socket.send(Buffer.from(JSON.stringify({ magic: MAGIC, probe: true })), DISCOVERY_PORT, '255.255.255.255'); } catch (e) {}
+  }
+  const timer = setInterval(probe, BEACON_MS);
+
+  return { stop: () => { stopped = true; clearInterval(timer); try { socket.close(); } catch (e) {} } };
+}
+
+module.exports = { startHubBeacon, listenForHub, listenForAnyHub, DISCOVERY_PORT, BEACON_MS };

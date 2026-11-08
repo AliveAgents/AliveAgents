@@ -192,6 +192,48 @@
     box-shadow: 0 10px 40px rgba(0,0,0,.6);
   }
   #perm-panel.open { display: flex; }
+  /* Signed out: a bar along the top edge. Deliberately not a dialog -- the agent is reachable and
+     everything else on the page still works, it just cannot think until it is signed in again. */
+  #login-bar {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 2147483647;
+    display: flex; align-items: center; gap: .6rem; flex-wrap: wrap;
+    padding: .55rem .8rem; background: #2a1d12; border-bottom: 1px solid #5a3a1c;
+    font-family: "Segoe UI", -apple-system, Helvetica, Arial, sans-serif;
+    font-size: .82rem; color: #f0d8c0;
+  }
+  #login-bar .login-text { flex: 1; min-width: 12rem; line-height: 1.4; }
+  #login-bar .login-link { color: #ffcf9b; text-decoration: underline; word-break: break-all; max-width: 100%; }
+  #login-bar .login-code {
+    background: #140f0a; border: 1px solid #5a3a1c; border-radius: 7px; padding: .4rem .55rem;
+    color: #f4e7d8; font-family: inherit; font-size: .82rem; min-width: 14rem; flex: 1;
+  }
+  #login-bar .login-code:focus { outline: none; border-color: #ffcf9b; }
+  /* The join form of a machine that has not been paired yet. Centred rather than tucked into a
+     corner: at that moment it is the only thing on the page worth looking at. */
+  #join-panel {
+    position: fixed; inset: 0; z-index: 2147483647; display: flex;
+    align-items: center; justify-content: center; padding: 18px;
+    background: rgba(8,9,12,.82); font-family: "Segoe UI", -apple-system, Helvetica, Arial, sans-serif;
+  }
+  .join-card {
+    width: 400px; max-width: 100%; background: #12151b; border: 1px solid #2b2e38;
+    border-radius: 11px; padding: 1rem 1.05rem 1.05rem; box-shadow: 0 10px 40px rgba(0,0,0,.6);
+    display: flex; flex-direction: column; gap: .75rem;
+  }
+  .join-title { color: #e9ebf0; font-size: 1.02rem; font-weight: 600; }
+  .join-intro { color: #c3c8d2; font-size: .82rem; line-height: 1.5; }
+  .join-row { display: flex; flex-direction: column; gap: .3rem; }
+  .join-row span { color: #99a0ae; font-size: .74rem; letter-spacing: .04em; text-transform: uppercase; }
+  .join-row input {
+    background: #0b0d12; border: 1px solid #2b2e38; border-radius: 7px; padding: .5rem .6rem;
+    color: #e9ebf0; font-size: .92rem; font-family: inherit;
+  }
+  .join-row input:focus { outline: none; border-color: #4d94ff; }
+  #join-code { font-variant-numeric: tabular-nums; letter-spacing: .08em; text-transform: uppercase; }
+  .join-foot { display: flex; align-items: center; gap: .6rem; }
+  .join-msg { flex: 1; font-size: .78rem; line-height: 1.4; color: #ff8a5c; min-height: 1em; }
+  .join-msg.ok { color: #6ee7a8; }
+  .join-msg.wait { color: #7fd1e8; }
   @media (max-width: 560px) {
     #perm-panel { left: 12px; right: 12px; bottom: 12px; width: auto; max-width: none; max-height: calc(100vh - 24px); }
   }
@@ -300,6 +342,31 @@
 </div>
 
 <div id="update-note" role="status" hidden></div>
+
+<!-- A bar across the top, shown only while this machine's Claude is signed out (claude-login.js).
+     Until this existed, an expired login could only be fixed from a terminal on the device. -->
+<div id="login-bar" role="status" hidden>
+  <span class="login-text" id="login-text"></span>
+  <a class="login-link" id="login-link" target="_blank" rel="noreferrer noopener" hidden></a>
+  <input class="login-code" id="login-code" type="text" autocomplete="off" spellcheck="false" placeholder="Paste the code from the browser" hidden>
+  <button class="perm-btn-primary" id="login-go" type="button">Sign in</button>
+</div>
+
+<!-- Shown only on a machine that does not belong to a network yet (join-mode.js). It is the whole
+     interface at that point: the face behind it is the generic one, because there is no agent yet. -->
+<div id="join-panel" hidden>
+  <div class="join-card">
+    <div class="join-title">Join a network</div>
+    <div class="join-intro" id="join-intro">This device is not part of a network yet.</div>
+    <label class="join-row"><span>Hub address</span><input id="join-host" type="text" inputmode="decimal" autocomplete="off" placeholder="192.168.178.90"></label>
+    <label class="join-row"><span>Name for this device</span><input id="join-name" type="text" autocomplete="off" spellcheck="false" placeholder="timo"></label>
+    <label class="join-row"><span>Pairing code</span><input id="join-code" type="text" autocomplete="off" spellcheck="false" placeholder="K7QF-2M9X-BTLR"></label>
+    <div class="join-foot">
+      <span class="join-msg" id="join-msg"></span>
+      <button class="perm-btn-primary" id="join-go" type="button">Join</button>
+    </div>
+  </div>
+</div>
 
 <div id="chat">
   <div class="chat-head"><span class="dot"></span><span id="chat-name"></span><button class="close" type="button" aria-label="Close">×</button></div>
@@ -419,12 +486,16 @@
       socket.send(JSON.stringify({ type: 'subscribe-chat' }));
       refreshPermissions();
       refreshUpdate();
+      refreshJoin();
+      refreshLogin();
     };
     socket.onmessage = (ev) => {
       let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
       if (m && m.type === 'page-reply') { const done = waiting.get(m.reqId); if (done) { waiting.delete(m.reqId); done(m); } return; }
       if (m && m.type === 'permissions' && m.status) { showPermissions(m.status); return; }
       if (m && m.type === 'update' && m.update) { showUpdate(m.update); return; }
+      if (m && m.type === 'join' && m.join) { showJoin(m.join); return; }
+      if (m && m.type === 'login' && m.login) { showLogin(m.login); return; }
       if (m && m.type === 'decisions' && Array.isArray(m.list)) { renderDecisions(m.list); return; }
       if (!m || m.type !== 'chat' || !m.agent) return;
       // "you" entries are echoed back by the server, but the panel already showed them optimistically.
@@ -800,7 +871,7 @@
     const u = updateState;
     const version = u && u.latest ? u.latest.version : '';
     const key = u ? u.status + ' ' + version : '';
-    const shown = !!u && ['available', 'manual', 'installing', 'restarting', 'installed'].includes(u.status) && updateDismissed !== key;
+    const shown = !!u && ['available', 'manual', 'git-update', 'installing', 'restarting', 'installed'].includes(u.status) && updateDismissed !== key;
     updateEl.hidden = !shown;
     if (!shown) return;
     updateEl.textContent = '';
@@ -809,7 +880,7 @@
     const title = document.createElement('div');
     title.className = 'update-title';
     const titleText = document.createElement('span');
-    titleText.textContent = { available: 'Update available', manual: 'Update needs a manual step', installing: 'Installing update', restarting: 'Update installed', installed: 'Update installed' }[u.status];
+    titleText.textContent = { available: 'Update available', manual: 'Update needs a manual step', 'git-update': 'Update available', installing: 'Installing update', restarting: 'Update installed', installed: 'Update installed' }[u.status];
     title.appendChild(titleText);
     if (u.status !== 'installing' && u.status !== 'restarting') {
       const close = document.createElement('button');
@@ -823,6 +894,7 @@
     body.textContent = {
       available: 'Version ' + version + ' of ' + name + '\'s program is ready, ' + u.changedCount + ' files. It installs after you confirm it, and ' + name + ' restarts once it is idle.',
       manual: 'Version ' + version + ' changes ' + u.manual.join(', ') + ', which cannot be replaced while ' + name + ' is running. Install it by hand.',
+      'git-update': 'Version ' + version + ' of ' + name + '\'s program is out, ' + u.changedCount + ' files. This copy came from git and does not replace itself: run "git pull" in ' + (u.root || 'its folder') + ', then restart ' + name + '.',
       installing: 'Downloading and checking version ' + version + '…',
       restarting: 'Version ' + version + ' is in place. ' + name + ' restarts as soon as it is idle.',
       installed: 'Version ' + version + ' is in place. Restart ' + name + ' to use it: close its window and start it again.'
@@ -864,6 +936,173 @@
       updateBusy = false;
       renderUpdate();
     }
+  }
+
+  // -- Signing this machine's Claude back in (claude-login.js) -----------------------------------
+  const loginBar = document.getElementById('login-bar');
+  const loginText = document.getElementById('login-text');
+  const loginLink = document.getElementById('login-link');
+  const loginCode = document.getElementById('login-code');
+  const loginGo = document.getElementById('login-go');
+  let loginState = null;
+  let loginBusy = false;
+  let loginDoneTimer = null;
+  root.appendChild(loginBar);
+
+  async function refreshLogin() {
+    try {
+      const m = await request('login-get', {});
+      if (m.login) showLogin(m.login);
+    } catch (e) { /* an agent from before this existed */ }
+  }
+
+  function showLogin(login) {
+    loginState = login;
+    const name = (permStatus && permStatus.agentName) || 'This agent';
+    const busyFlow = login.status === 'starting' || login.status === 'waiting' || login.status === 'submitted';
+    loginBar.hidden = !(login.needed || busyFlow || login.status === 'done');
+    if (loginBar.hidden) return;
+
+    const line = {
+      idle: name + ' is signed out of Claude and cannot answer until it is signed in again.',
+      starting: 'Opening the sign-in…',
+      waiting: '1. Open this address and sign in. 2. Copy the code it shows you. 3. Paste it here and press Send code.',
+      submitted: 'Checking the code…',
+      done: 'Signed in. ' + name + ' can answer again — ask once more.',
+      failed: login.message || 'That did not work.'
+    }[login.status] || (login.message || '');
+    loginText.textContent = login.message && login.status !== 'waiting' && login.status !== 'done' ? login.message : line;
+
+    // Nothing left to do once it worked: the bar says so and then gets out of the way.
+    if (login.status === 'done' && !loginDoneTimer) {
+      loginDoneTimer = setTimeout(() => { loginDoneTimer = null; if (loginState && loginState.status === 'done') loginBar.hidden = true; }, 8000);
+    }
+    const showUrl = login.status === 'waiting' && !!login.url;
+    loginLink.hidden = !showUrl;
+    if (showUrl) { loginLink.href = login.url; loginLink.textContent = login.url; }
+    loginCode.hidden = !showUrl;
+    loginGo.hidden = login.status === 'done' || login.status === 'submitted';
+    loginGo.textContent = showUrl ? 'Send code' : 'Sign in';
+    loginGo.disabled = loginBusy || !login.available;
+    if (!login.available) loginText.textContent = login.message
+      || (name + ' is signed out, and this machine cannot run the sign-in from here. Sign in in its own window.');
+  }
+
+  // Asks again for a little while after each step. The agent pushes every change by itself, so this
+  // only matters when a push is missed -- which it was, for an afternoon, because the line that
+  // routes those pushes was missing and the bar simply sat at "Checking the code…" forever.
+  function pollLogin(untilDone) {
+    let left = 15;
+    const timer = setInterval(async () => {
+      left -= 1;
+      if (left <= 0) { clearInterval(timer); return; }
+      try {
+        const m = await request('login-get', {});
+        if (!m.login) return;
+        showLogin(m.login);
+        if (untilDone(m.login)) clearInterval(timer);
+      } catch (e) { /* the agent is restarting, say -- the next tick tries again */ }
+    }, 2000);
+  }
+
+  async function loginAction() {
+    if (loginBusy || !loginState) return;
+    loginBusy = true;
+    loginGo.disabled = true;
+    try {
+      const waiting = loginState.status === 'waiting';
+      const r = waiting
+        ? await request('login-code', { code: loginCode.value.trim() }, 60000)
+        : await request('login-start', {}, 60000);
+      if (r.error) { loginText.textContent = r.error; }
+      if (r.login) showLogin(r.login);
+      if (waiting && !r.error) {
+        loginCode.value = '';
+        pollLogin((s) => s.status === 'done' || s.status === 'failed' || s.status === 'idle');
+      } else if (!r.error) {
+        pollLogin((s) => !!s.url || s.status === 'failed');
+      }
+    } catch (e) {
+      loginText.textContent = e.message;
+    } finally {
+      loginBusy = false;
+      if (loginState) showLogin(loginState);
+    }
+  }
+
+  loginGo.addEventListener('click', loginAction);
+  loginCode.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); loginAction(); } });
+
+  // -- Joining a network (join-mode.js) ----------------------------------------------------------
+  // Only ever shown on a machine that has not been paired yet. The agent on the other side of this
+  // socket is not an agent at all then -- it is the join mode, and this form is all it can do.
+  const joinPanel = document.getElementById('join-panel');
+  const joinHost = document.getElementById('join-host');
+  const joinName = document.getElementById('join-name');
+  const joinCode = document.getElementById('join-code');
+  const joinGo = document.getElementById('join-go');
+  const joinMsg = document.getElementById('join-msg');
+  const joinIntro = document.getElementById('join-intro');
+  let joinBusy = false;
+  let joinPort = 8788;
+  root.appendChild(joinPanel);
+
+  async function refreshJoin() {
+    try {
+      const m = await request('join-get', {});
+      if (m.join) showJoin(m.join);
+    } catch (e) { /* a machine that is already part of a network never answers this */ }
+  }
+
+  function setJoinMsg(text, kind) {
+    joinMsg.textContent = text || '';
+    joinMsg.className = 'join-msg' + (kind ? ' ' + kind : '');
+  }
+
+  function showJoin(join) {
+    joinPanel.hidden = false;
+    joinPort = join.defaultPort || joinPort;
+    if (join.hub) {
+      // Filled in, never acted on by itself: the user sees the address before anything is sent, and
+      // the pairing code is what actually decides who this machine ends up trusting.
+      if (!joinHost.value || joinHost.dataset.fromBeacon === '1') {
+        joinHost.value = join.hub.host;
+        joinHost.dataset.fromBeacon = '1';
+      }
+      if (join.hub.port) joinPort = join.hub.port;
+      joinIntro.textContent = 'A hub called "' + join.hub.hubName + '" is at ' + join.hub.host
+        + '. Ask it for a pairing code, then enter it here.';
+    }
+    joinGo.disabled = joinBusy || join.status === 'joining' || join.status === 'joined';
+    if (join.status === 'joining') setJoinMsg(join.message || 'Pairing…', 'wait');
+    else if (join.status === 'joined') {
+      setJoinMsg((join.message || 'Paired.') + (join.restartable ? ' Starting as a full agent…' : ' Start it again to bring it up.'), 'ok');
+    } else if (join.message) setJoinMsg(join.message, '');
+  }
+
+  async function joinNetwork() {
+    if (joinBusy) return;
+    joinBusy = true;
+    joinGo.disabled = true;
+    setJoinMsg('Pairing…', 'wait');
+    try {
+      const r = await request('join-submit', {
+        host: joinHost.value.trim(), port: joinPort,
+        name: joinName.value.trim().toLowerCase(), code: joinCode.value.trim()
+      }, 90000);
+      if (r.error) { setJoinMsg(r.error, ''); joinGo.disabled = false; }
+      else if (r.join) showJoin(r.join);
+    } catch (e) {
+      setJoinMsg(e.message, '');
+      joinGo.disabled = false;
+    } finally {
+      joinBusy = false;
+    }
+  }
+
+  joinGo.addEventListener('click', joinNetwork);
+  for (const el of [joinHost, joinName, joinCode]) {
+    el.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); joinNetwork(); } });
   }
 
   sendBtn.addEventListener('click', send);

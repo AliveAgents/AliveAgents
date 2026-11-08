@@ -14,6 +14,8 @@
   "domain": "Responsible for the website, Cloudflare, booking.com, and the git repository containing the website code.",
   "personality": "Direct and pragmatic, answering in 1-3 short, chat-style sentences. No preamble phrases like \"As an AI, I would say\".",
   "effort": "high",
+  "_extraDirs": "Optional. Further folders this agent may read and change, besides workDir. Claude Code confines file access to the directory it runs in, so naming a path elsewhere is not enough -- each folder listed here is opened as a root of its own. Whether the agent may WRITE in them is the \"Change files in its project folders\" switch on its face page. A folder that does not exist is skipped with a note. e.g. [\"/data/data/com.termux/files/home/minecraft\", \"/storage/emulated/0/Notes\"]",
+  "extraDirs": [],
   "_taskTimeoutMinutes": "Optional, 15 by default. How long one turn may take before this agent gives up on it and says so out loud instead of going quiet. A turn that hangs would otherwise leave the agent silent for good and reserved at the hub. 0 switches the watchdog off.",
   "taskTimeoutMinutes": 15,
   "_model": "Optional. Which model answers for this agent: an alias like \"opus\" or \"sonnet\" for the latest of that family, or a full name like \"claude-opus-5-5\". Omit it and the agent uses whatever the Claude CLI on that machine is set to.",

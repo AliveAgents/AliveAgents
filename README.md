@@ -79,7 +79,9 @@ Talk to the hub's microphone button and the network takes it from there. Away fr
 
 ### Adding another agent
 
-Say *"set up a new agent called Ada for the calendar"*. The hub reads you a one-time pairing code, and on the new machine you run:
+Say *"set up a new agent called Ada for the calendar"*. The hub reads you a one-time pairing code. On the new machine, start it before it belongs anywhere — `start-node.bat`, or `bash start-node.sh` on a phone — and open `http://localhost:8787/`: a machine with no configuration shows a join form instead of a face. It finds the hub on the network by itself and asks for a name and the code. Nothing else is needed.
+
+The same thing from a terminal, if you prefer one:
 
 ```bash
 enroll.bat 192.168.178.90 K7QF-2M9X-BTLR ada
@@ -87,7 +89,7 @@ enroll.bat 192.168.178.90 K7QF-2M9X-BTLR ada
 
 That machine generates its own key pair locally and joins — **no private key is ever copied between machines**, and the hub picks it up without a restart. The code exists to prove the exchange is happening with the machine you're standing at rather than someone else on the network: it's mixed into a proof covering both certificates, so a relayed handshake doesn't verify. (`/provision <name>` on the hub console does the same thing without the microphone.)
 
-**A phone as a node.** An Android phone runs an agent through [Termux](https://termux.dev/), without root. Install **Termux** and **Termux:API** from [F-Droid](https://f-droid.org/) or Termux's own releases, both from the same source — **not the Play Store build**: that one carries a smaller package repository with no glibc runtime, and without it there is no Claude Code on Android (`setup-termux.sh` says so and stops). Then clone the repository on the phone and run `bash setup-termux.sh` once — it installs what is needed and checks that Claude Code starts and receives its prompts intact — then enroll with `node enroll.js <hub-ip> <code> <name>` and start with `bash start-node.sh`. A phone speaks with its own text-to-speech engine, so it needs no voice model.
+**A phone as a node.** An Android phone runs an agent through [Termux](https://termux.dev/), without root. Install **Termux** and **Termux:API** from [F-Droid](https://f-droid.org/) or Termux's own releases, both from the same source — **not the Play Store build**: that one carries a smaller package repository with no glibc runtime, and without it there is no Claude Code on Android (`setup-termux.sh` says so and stops). Then clone the repository on the phone and run `bash setup-termux.sh` once — it installs what is needed and checks that Claude Code starts, receives its prompts intact, and can run a shell command. After that, `bash start-node.sh` and the rest happens in the phone's browser at `http://localhost:8787/`: the join form above, and, should the phone's Claude login ever expire, a bar offering to sign it back in there instead of in a terminal. A phone speaks with its own text-to-speech engine, so it needs no voice model.
 
 ## Roadmap
 

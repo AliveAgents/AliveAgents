@@ -6,6 +6,11 @@ node_modules/
 # Secrets -- real tokens/keys, never committed. See the matching *.local.*.example templates.
 *.local.bat
 *.local.json
+*.local.sh
+# Google hands out its OAuth client files under this name. One landed in this folder on 2026-11-08,
+# untracked -- which a release would have picked up and published, because publish-release.js takes
+# "everything git would publish", and untracked-but-not-ignored counts.
+client_secret_*
 certs/*.pem
 
 # Personal, per-installation config -- only the example template is tracked.
@@ -38,3 +43,6 @@ backup-de-migration/
 Thumbs.db
 .vscode/
 .idea/
+
+# What a failed Claude sign-in last said, for diagnosing one (claude-login.js). Per machine, never shared.
+.login-last.log

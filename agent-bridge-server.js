@@ -1282,7 +1282,12 @@ function startProvisioning(wanted) {
   // on, and this is printed where it can be read and retyped exactly.
   console.log('');
   console.log(`  Enrolling a new agent: "${name}"`);
-  console.log(`  On the NEW machine run:   enroll.bat ${getLanIp()} ${code}`);
+  // Both forms, and both WITH the name: enroll takes three arguments and refuses a name other than
+  // the one this code was issued for, so a line that shows only two is a line that fails. The .bat is
+  // the Windows launcher and does not exist on a phone, which is where new agents usually arrive
+  // (asked twice by the user, 2026-10-02 and 2026-11-07 -- the hint, not the person, was at fault).
+  console.log(`  On a NEW Windows machine:   enroll.bat ${getLanIp()} ${code} ${name}`);
+  console.log(`  On a phone or Linux box:    node enroll.js ${getLanIp()} ${code} ${name}`);
   console.log(`  Valid for ${enrollmentLib.ENROLL_TIMEOUT_MS / 60000} minutes, ${enrollmentLib.MAX_ATTEMPTS} attempts.`);
   console.log('');
   return { code, name };
@@ -1407,12 +1412,35 @@ function askOscarDirectly(userText, myRequestId) {
     if (myRequestId !== activeRequestByTarget.get(HUB_TARGET)) return; // superseded by newer input (e.g. aborted), discard
     if (code !== 0) {
       console.error('claude CLI error:', errOut);
+      // The saved conversation is gone: the CLI keeps its history for a while and then prunes it, and
+      // resuming a pruned one fails on EVERY turn from then on -- the agent answers nothing until
+      // somebody notices and types /reset. Seen on Oscar on 2026-11-07, with a session from 2026-10-02
+      // behind it. Starting a new conversation costs this one turn's memory instead of all future ones.
+      // It cannot loop: the retry runs with no session id, so this branch cannot be reached again.
+      if (sessionId && /No conversation found with session ID/i.test(errOut)) {
+        console.log(`[${AGENT.name}] That conversation no longer exists -- starting a new one and asking again.`);
+        sessionId = null;
+        try { fs.unlinkSync(SESSION_FILE); } catch (e) { /* already gone */ }
+        askOscarDirectly(userText, myRequestId);
+        return;
+      }
       say('Something just went wrong.', myRequestId, AGENT.name, false);
       return;
     }
     let text = '';
     try {
       const parsed = JSON.parse(out);
+      // Exit code 0 does not mean the turn worked: a failure is reported inside the JSON, and
+      // "result" is then the error text. Read out as an answer it sounds like the agent talking
+      // nonsense -- see the same spot in node-agent.js for the afternoon that cost.
+      if (parsed.is_error === true) {
+        const why = String(parsed.result || '').trim();
+        console.error(`[${AGENT.name}] The CLI ended this turn with an error: ${why || '(no reason given)'}`);
+        say(/not logged in|authenticate|oauth/i.test(why)
+          ? 'I am not logged in on this machine any more, so I cannot answer until that is sorted out.'
+          : 'Something just went wrong.', myRequestId, AGENT.name, false);
+        return;
+      }
       text = parsed.result || '';
       if (parsed.session_id) {
         sessionId = parsed.session_id;
@@ -1464,7 +1492,7 @@ function askOscarDirectly(userText, myRequestId) {
       const res = startProvisioning(provision);
       const extra = res.error
         ? ` ${res.error}`
-        : ` Your pairing code is: ${speakableCode(res.code)} It is also printed on my console, and it is valid for ${enrollmentLib.ENROLL_TIMEOUT_MS / 60000} minutes. On the new machine, run enroll dot bat with my address and that code.`;
+        : ` Your pairing code is: ${speakableCode(res.code)} It is also printed on my console, and it is valid for ${enrollmentLib.ENROLL_TIMEOUT_MS / 60000} minutes. On the new machine, run the enrolment command my console prints -- it has my address, the code and the name already in it.`;
       say((spokenText + extra).trim(), myRequestId, AGENT.name, true, suggested);
       return;
     }

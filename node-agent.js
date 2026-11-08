@@ -26,6 +26,7 @@ const permissionsLib = require('./permissions.js');
 const deviceConfirm = require('./device-confirm.js');
 const { startClaude, MESSAGE_MAX_CHARS } = require('./claude-cli.js');
 const updaterLib = require('./updater.js');
+const loginLib = require('./claude-login.js');
 
 // Spawn the real claude.exe directly instead of the bare 'claude' command whenever the bundled
 // portable install is present. On Windows, 'claude' resolves to claude.cmd, and spawning a .cmd
@@ -43,9 +44,14 @@ const CLAUDE_EXE = (() => {
 })();
 
 const CONFIG_FILE = process.env.AGENT_NET_CONFIG || path.join(__dirname, 'net-config.json');
+// No configuration means this machine has never been paired. Rather than refusing to start, it comes
+// up with its face page and nothing else: a form for the hub's address, a name and the pairing code
+// (join-mode.js). Everything below here assumes a network this machine belongs to, so the file ends
+// at this return -- a module body may return, and that keeps the two modes from having to know about
+// each other. The moment pairing succeeds, the process restarts and runs the rest of this file.
 if (!fs.existsSync(CONFIG_FILE)) {
-  console.error(`${CONFIG_FILE} is missing. Rename net-config.example.json to net-config.json and adjust it.`);
-  process.exit(1);
+  require('./join-mode.js').start({ configFile: CONFIG_FILE, certDir: path.join(__dirname, 'certs') });
+  return;
 }
 // readJsonFile instead of a bare JSON.parse: a UTF-8 byte order mark at the start of the file
 // makes JSON.parse throw, and the agent then dies at startup with a stack trace that says nothing
@@ -130,9 +136,11 @@ const overlay = startOverlayServer({
   faceRecipe: config.faceRecipe || null,
   // This device's own permissions page. permissionStore is created further down; nothing can ask
   // before the module has finished loading.
-  onPageMessage: (msg, reply) => (updaterLib.PAGE_MESSAGE_TYPES.includes(msg.type)
-    ? updater.handlePageMessage(msg, reply)
-    : permissionsLib.handlePageMessage(permissionStore, msg, reply, (obj) => overlay.pushPage(obj))),
+  onPageMessage: (msg, reply) => {
+    if (updaterLib.PAGE_MESSAGE_TYPES.includes(msg.type)) return updater.handlePageMessage(msg, reply);
+    if (loginLib.PAGE_MESSAGE_TYPES.includes(msg.type)) return login.handlePageMessage(msg, reply);
+    return permissionsLib.handlePageMessage(permissionStore, msg, reply, (obj) => overlay.pushPage(obj));
+  },
   onScreenChange: (screen) => {
     myScreen = screen;
     refreshSkillData();
@@ -155,6 +163,13 @@ const FACE_TINT = normalizeTint(config.faceTint);
 // lives only as a recipe in this machine's own config, so the screen showing it has no way to look it
 // up. undefined for an agent wearing one of the hand-written faces -- those exist everywhere.
 const OWN_FACE_RECIPE = config.faceStyle === 'own' && config.faceRecipe ? config.faceRecipe : undefined;
+
+// Signing this agent's Claude Code back in from its own page, for when its login expires (an expired
+// one makes every turn fail while the agent looks perfectly healthy -- see claude-login.js).
+const login = loginLib.createLogin({
+  log: console.log,
+  onChange: (s) => { try { overlay.pushPage({ type: 'login', login: s }); } catch (e) { /* no page open */ } }
+});
 
 // The style name under which another agent's face can be shown HERE. A generated face ('own') only
 // means something on the machine it belongs to, so the recipe that came with the message is
@@ -246,6 +261,33 @@ const WORK_DIR = (() => {
   return resolved;
 })();
 
+// Optional per agent in net-config.json: "extraDirs": ["/data/.../minecraft", "/sdcard/notes"] --
+// further folders this agent may read and change, besides its working directory. Claude Code
+// confines file access to the directory it runs in, so a path alone grants nothing: each folder has
+// to be opened as a root of its own with --add-dir (further down), and the "Change files in its
+// project folders" switch is what decides whether writing in them is allowed at all.
+// A folder that does not exist is reported and skipped rather than passed on, because the CLI
+// refuses to start at all over a bad --add-dir, which would take the whole agent down with it.
+const EXTRA_DIRS = (() => {
+  const raw = Array.isArray(config.extraDirs) ? config.extraDirs : [];
+  const seen = new Set([path.resolve(WORK_DIR), path.resolve(HOME), path.resolve(__dirname)]);
+  const out = [];
+  for (const entry of raw) {
+    const resolved = path.resolve(String(entry || ''));
+    if (!entry || seen.has(resolved)) continue;      // already a root, or an empty entry
+    if (!fs.existsSync(resolved)) {
+      console.error(`[agent] extraDirs: "${resolved}" does not exist -- skipped.`);
+      continue;
+    }
+    seen.add(resolved);
+    out.push(resolved);
+  }
+  return out;
+})();
+// Every folder this agent works in that is not its own home: its project and the extra ones. One
+// permission switch covers them (permissions.js).
+const PROJECT_DIRS = (path.resolve(WORK_DIR) !== path.resolve(HOME) ? [WORK_DIR] : []).concat(EXTRA_DIRS);
+
 // Always absolute now. The agent never runs inside this checkout any more, so a relative
 // "presented_content" or "inbox" would resolve against its home or its project -- it would write
 // decks and look for files somewhere the overlay server never serves.
@@ -291,7 +333,7 @@ const confirmer = deviceConfirm.createConfirmer();
 const permissionStore = permissionsLib.createPermissionStore({
   id: config.self, role: 'node', agentName: () => AGENT.name,
   seed: permissionsLib.seedFromConfig({ role: 'node', allowedTools: config.allowedTools, chrome: config.chrome, mcpConfig: config.mcpConfig, permissionMode: config.permissionMode }),
-  available: { mcp: !!config.mcpConfig, workDir: path.resolve(WORK_DIR) !== path.resolve(HOME) },
+  available: { mcp: !!config.mcpConfig, workDir: PROJECT_DIRS.length > 0 },
   confirmer
 });
 confirmer.ready.then(() => overlay.pushPage({ type: 'permissions', status: permissionStore.status() }));
@@ -592,13 +634,23 @@ function sayWithPresentation(slideTexts, myRequestId, hubRequestId, url, suggest
 // ever said, which is true and useless: the three failures that actually happen have very different
 // answers, and the user hears this sentence instead of reading a log. Matched against the CLI's own
 // wording, never echoed: its output is not something to read aloud unseen.
+// "authenticat" covers both the noun and "Failed to authenticate", which is the wording the CLI
+// actually used when the login on a phone expired (2026-11-07) -- matching "authentication" alone
+// missed it and the agent fell back to the useless generic sentence.
+function looksLikeAuthProblem(text) {
+  const t = String(text || '').toLowerCase();
+  return t.includes('not logged in') || t.includes('/login') || t.includes('authenticat') || t.includes('oauth') || t.includes('session expired');
+}
+
 function describeCliFailure(errOut, out) {
   const text = `${errOut || ''} ${out || ''}`.toLowerCase();
   if (text.includes('usage limit') || text.includes('rate limit') || text.includes('too many requests')) {
     return 'I have hit the usage limit on my account, so I cannot answer until it resets.';
   }
-  if (text.includes('not logged in') || text.includes('/login') || text.includes('authentication')) {
-    return 'I am not logged in on this machine any more, so I cannot answer until that is sorted out.';
+  if (looksLikeAuthProblem(text)) {
+    // The page can offer the way out of this one (claude-login.js), so it is told.
+    login.setNeeded(true);
+    return 'I am not logged in on this machine any more. Sign me in again on my own page, then ask me once more.';
   }
   if (text.includes('model') && (text.includes('not found') || text.includes('not available') || text.includes('does not exist'))) {
     return 'The model I am set to use is not available to me right now.';
@@ -670,7 +722,7 @@ function runTask(userText, myRequestId, hubRequestId, isMainDisplay = false, opt
   const mcpConfig = rawMcp ? (rawMcp.startsWith('{') || path.isAbsolute(rawMcp) ? rawMcp : path.join(__dirname, rawMcp)) : null;
   args.push(...permissionsLib.claudePermissionArgs(turnPermissions, {
     contentDir: path.join(__dirname, 'presented_content'), inboxDir: path.join(__dirname, 'inbox'),
-    workspaceDir: WORKSPACE_DIR, projectDir: path.resolve(WORK_DIR) !== path.resolve(HOME) ? WORK_DIR : null,
+    workspaceDir: WORKSPACE_DIR, projectDirs: PROJECT_DIRS,
     extraTools: permissionsLib.extraToolsFrom(config.allowedTools), mcpConfig
   }));
 
@@ -683,6 +735,9 @@ function runTask(userText, myRequestId, hubRequestId, isMainDisplay = false, opt
   // The home, for the skills and their data files. Only needed when the agent works in a project:
   // working in its home, the skills are already that directory's own project skills.
   if (path.resolve(WORK_DIR) !== path.resolve(HOME)) args.push('--add-dir', HOME);
+  // The further folders from the config -- without this the agent can name such a path but not
+  // reach it, and politely says so instead of working.
+  for (const dir of EXTRA_DIRS) args.push('--add-dir', dir);
 
   const child = startClaude(CLAUDE_EXE, args, prompt, { cwd: WORK_DIR });
   currentClaudeChild = child;
@@ -724,12 +779,35 @@ function runTask(userText, myRequestId, hubRequestId, isMainDisplay = false, opt
     if (myRequestId !== requestId) return;
     if (code !== 0) {
       console.error('claude CLI error:', errOut);
+      // Same as on the hub (see askOscarDirectly): a session the CLI has meanwhile pruned makes every
+      // single turn fail, so the agent goes mute until someone resets it by hand. One turn of memory
+      // is the cheaper loss. No loop is possible -- the retry carries no session id.
+      if (sessionId && /No conversation found with session ID/i.test(errOut)) {
+        console.log(`[${AGENT.name}] That conversation no longer exists -- starting a new one and trying again.`);
+        sessionId = null;
+        try { fs.unlinkSync(SESSION_FILE); } catch (e) { /* already gone */ }
+        runTask(userText, myRequestId, hubRequestId, isMainDisplay, options);
+        return;
+      }
       say(describeCliFailure(errOut, out), myRequestId, hubRequestId, [], isMainDisplay);
       return;
     }
     let text = '';
     try {
       const parsed = JSON.parse(out);
+      // A failed turn can still leave the CLI with exit code 0: it reports the failure INSIDE the
+      // JSON as is_error, and "result" is then the error text, not an answer. Taken at face value,
+      // the agent cheerfully reads that text out as if it were its reply -- Steve spent an
+      // afternoon saying "Failed to authenticate: OAuth session expired and could not be refreshed"
+      // to an empty room (2026-11-07), while the hub logged it as his answer.
+      if (parsed.is_error === true) {
+        const why = String(parsed.result || '').trim();
+        console.error(`[${AGENT.name}] The CLI ended this turn with an error: ${why || '(no reason given)'}`);
+        say(describeCliFailure(why, ''), myRequestId, hubRequestId, [], isMainDisplay);
+        return;
+      }
+      // A turn that worked is the only proof that the login is good again.
+      login.setNeeded(false);
       text = parsed.result || '';
       if (parsed.session_id) { sessionId = parsed.session_id; saveSessionId(sessionId); }
       // Surface tokens for usage monitoring -- newly processed (full price) shown separately from

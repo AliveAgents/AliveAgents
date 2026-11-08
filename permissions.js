@@ -37,7 +37,7 @@ const CATALOGUE = [
   { key: 'presentations', label: 'Create and show presentations', does: 'create and show presentations', roles: ['hub', 'node'] },
   { key: 'workspace', label: 'Write files in its own folder', does: 'write files in its own folder', roles: ['hub', 'node'] },
   { key: 'files', label: 'Receive files', does: 'receive files', roles: ['hub', 'node'] },
-  { key: 'projectEdit', label: 'Change files in its project folder', does: 'change files in its project folder', roles: ['node'], needs: 'workDir' },
+  { key: 'projectEdit', label: 'Change files in its project folders', does: 'change files in its project folders', roles: ['node'], needs: 'workDir' },
   { key: 'forward', label: 'Involve other agents', does: 'involve other agents', roles: ['hub', 'node'] },
   { key: 'identityRequests', label: 'Ask to change its name or responsibility', does: 'ask to change its name or responsibility', roles: ['node'] },
   { key: 'provision', label: 'Set up new agents', does: 'set up new agents', roles: ['hub'] },
@@ -80,14 +80,19 @@ function writeJsonAtomic(file, value) {
 //     given explicitly, every switched-off tool is named in --disallowedTools (a forbidden tool is not even
 //     offered to the model), and an agent allowed to change its project folder is kept out of that
 //     folder's .claude/ and .mcp.json, so it cannot write such a file for its next turn.
-// paths: { contentDir, inboxDir, workspaceDir, projectDir, extraTools, mcpConfig }
+// paths: { contentDir, inboxDir, workspaceDir, projectDirs (or a single projectDir), extraTools, mcpConfig }
 function claudePermissionArgs(p, paths) {
   const rule = (dir) => `Edit(${permissionPath(dir)}/**)`;
+  // The folders this agent works in besides its own home: its working directory, plus any further
+  // ones its config names (extraDirs). One switch governs all of them -- they are the same kind of
+  // place, and a per-folder switch would turn the shield page into a file manager. A single
+  // projectDir is still accepted, which is what the hub passes (it has none).
+  const projectDirs = (paths.projectDirs || (paths.projectDir ? [paths.projectDir] : [])).filter(Boolean);
   const tools = ['Skill'];
   if (p.presentations) tools.push(rule(paths.contentDir));
   if (p.files) tools.push(rule(paths.inboxDir));
   if (p.workspace) tools.push(rule(paths.workspaceDir));
-  if (p.projectEdit && paths.projectDir) tools.push(rule(paths.projectDir));
+  if (p.projectEdit) for (const dir of projectDirs) tools.push(rule(dir));
   if (p.webSearch) tools.push('WebSearch');
   if (p.webFetch) tools.push('WebFetch');
   if (p.mcp && paths.extraTools) tools.push(...String(paths.extraTools).split(',').map((t) => t.trim()).filter(Boolean));
@@ -107,8 +112,12 @@ function claudePermissionArgs(p, paths) {
     if (!p.presentations) deny.push(rule(paths.contentDir));
     if (!p.files) deny.push(rule(paths.inboxDir));
     if (!p.workspace) deny.push(rule(paths.workspaceDir));
-    if (paths.projectDir && !p.projectEdit) deny.push(rule(paths.projectDir));
-    if (paths.projectDir && p.projectEdit) deny.push(`Edit(${permissionPath(paths.projectDir)}/.claude/**)`, `Edit(${permissionPath(paths.projectDir)}/.mcp.json)`);
+    for (const dir of projectDirs) {
+      if (!p.projectEdit) deny.push(rule(dir));
+      // Even allowed to change a folder, never its agent settings: .claude/ and .mcp.json there
+      // would let an agent widen what it may do on its next turn.
+      else deny.push(`Edit(${permissionPath(dir)}/.claude/**)`, `Edit(${permissionPath(dir)}/.mcp.json)`);
+    }
     if (deny.length) args.push('--disallowedTools', deny.join(','));
   }
   if (p.mcp && paths.mcpConfig) args.push('--mcp-config', paths.mcpConfig);

@@ -343,7 +343,9 @@ confirmer.ready.then(() => overlay.pushPage({ type: 'permissions', status: permi
 const updater = updaterLib.createUpdater({
   root: __dirname, agentName: () => AGENT.name, confirmer,
   isIdle: () => !currentClaudeChild && !currentPresentation && overlay.getState().status === 'idle',
-  onChange: (update) => overlay.pushPage({ type: 'update', update })
+  onChange: (update) => overlay.pushPage({ type: 'update', update }),
+  // Only for a copy nobody edits by hand -- see net-config.example.json.
+  autoUpdate: config.autoUpdate === true
 });
 updater.start();
 
@@ -693,12 +695,12 @@ function runTask(userText, myRequestId, hubRequestId, isMainDisplay = false, opt
   // breaks -- a pasted text on the command line once ended this whole process (ENAMETOOLONG).
   const prompt = sessionId
     ? [userText, events].filter(Boolean).join('\n\n')
-    : [`You are ${AGENT.name}, part of a network of AI assistants coordinated by Oscar. ${AGENT.personality}`, events, `Message: ${userText}`].filter(Boolean).join('\n\n');
+    : [`You are ${AGENT.name}, part of a network of AI assistants coordinated by Oscar.`, events, `Message: ${userText}`].filter(Boolean).join('\n\n');
   const args = ['-p'];
   if (sessionId) args.push('--resume', sessionId);
   // Only a pointer to the skills. It still goes through --append-system-prompt rather than the
   // message -- see buildSystemPointer for why -- and it is identical on every turn.
-  args.push('--append-system-prompt', buildSystemPointer({ agentName: AGENT.name }));
+  args.push('--append-system-prompt', buildSystemPointer({ agentName: AGENT.name, personality: AGENT.personality }));
   args.push('--output-format', 'json');
   // Optional per agent in net-config.json: "effort": "low|medium|high|xhigh|max" -- controls how
   // much thinking effort the CLI invests before answering. Omitted = CLI default, unchanged.

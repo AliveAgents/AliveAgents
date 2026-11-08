@@ -894,7 +894,7 @@
     body.textContent = {
       available: 'Version ' + version + ' of ' + name + '\'s program is ready, ' + u.changedCount + ' files. It installs after you confirm it, and ' + name + ' restarts once it is idle.',
       manual: 'Version ' + version + ' changes ' + u.manual.join(', ') + ', which cannot be replaced while ' + name + ' is running. Install it by hand.',
-      'git-update': 'Version ' + version + ' of ' + name + '\'s program is out, ' + u.changedCount + ' files. This copy came from git and does not replace itself: run "git pull" in ' + (u.root || 'its folder') + ', then restart ' + name + '.',
+      'git-update': 'Version ' + version + ' of ' + name + '\'s program is out, ' + u.changedCount + ' files. This copy came from git' + (u.autoUpdate ? ' and brings it in by itself as soon as ' + name + ' is idle.' : ': installing it fast-forwards this folder to the published version.'),
       installing: 'Downloading and checking version ' + version + '…',
       restarting: 'Version ' + version + ' is in place. ' + name + ' restarts as soon as it is idle.',
       installed: 'Version ' + version + ' is in place. Restart ' + name + ' to use it: close its window and start it again.'
@@ -905,7 +905,7 @@
     meta.textContent = 'Installed: ' + (u.installed || 'a version from before updates') + (u.latest && u.latest.published ? ' · new one published ' + String(u.latest.published).slice(0, 10) : '');
 
     updateEl.append(title, body, meta);
-    if (u.status === 'available') {
+    if (u.status === 'available' || u.status === 'git-update') {
       const actions = document.createElement('div');
       actions.className = 'update-actions';
       const msg = document.createElement('span');

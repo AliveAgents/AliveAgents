@@ -46,3 +46,9 @@ Thumbs.db
 
 # What a failed Claude sign-in last said, for diagnosing one (claude-login.js). Per machine, never shared.
 .login-last.log
+
+# A Minecraft server with a real world and real player identities (ops/usercache.json) was dropped
+# in here on 2026-11-08 to hand it to an agent. Untracked-but-not-ignored is what a release
+# publishes, so 430 MB of it would have gone to GitHub. It lives outside this folder now; the rule
+# stays so a second copy cannot repeat that.
+planet-survival/

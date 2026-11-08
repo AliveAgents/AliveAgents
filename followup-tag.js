@@ -150,7 +150,7 @@ function extractIdentityTag(text) {
 //
 // One line, no embedded newline: Windows splits command-line arguments at real line breaks, which
 // once truncated a prompt and broke the JSON output.
-function buildSystemPointer({ agentName, canProvision = false }) {
+function buildSystemPointer({ agentName, personality = '', canProvision = false }) {
   const skills = [
     '`network` (who is online right now, what each agent is responsible for, and how to pass something on to one of them or to everyone)',
     '`presentation` (showing something on a screen while you talk)',
@@ -161,7 +161,15 @@ function buildSystemPointer({ agentName, canProvision = false }) {
   if (canProvision) skills.push('`new-agent` (setting up a new agent on another machine)');
   // The clause about addresses is here and not only in the skill: the web search tool's own instructions
   // ask for a list of links at the end of every answer that used it, and the voice read them out.
-  return `You are ${agentName}, one of several AI agents on a small local network, each on its own machine with its own voice. Your replies are spoken aloud, so keep them to a few natural sentences unless you are presenting, and never put a web address, link or file path in them -- name the source instead. Everything that involves the rest of the network is described in your skills: ${skills.join(', ')}. Who is online changes while you run, so load \`network\` again whenever you are about to involve someone else, rather than relying on what you saw earlier.`;
+  // The personality from net-config.json belongs HERE rather than in the first message of a
+  // conversation. A resumed turn sends no first message, so anything stated only there is stated
+  // once and then never again -- and nothing afterwards says how this agent is meant to answer.
+  // Measured 2026-11-08 on a phone agent that had been replying in German for weeks although it was
+  // written to in English: no turn told it which language to use, so the drift of its own earlier
+  // replies decided. Whitespace is collapsed because this string is one command-line argument and
+  // Windows splits those at real line breaks (which once truncated a prompt and broke the output).
+  const style = String(personality || '').replace(/\s+/g, ' ').trim();
+  return `You are ${agentName}, one of several AI agents on a small local network, each on its own machine with its own voice.${style ? ' ' + style : ''} Your replies are spoken aloud, so keep them to a few natural sentences unless you are presenting, and never put a web address, link or file path in them -- name the source instead. Everything that involves the rest of the network is described in your skills: ${skills.join(', ')}. Who is online changes while you run, so load \`network\` again whenever you are about to involve someone else, rather than relying on what you saw earlier.`;
 }
 
 module.exports = { extractFollowUpTag, buildSystemPointer, extractPresentationTag, splitSlideSegments, extractProvisionTag, extractIdentityTag };

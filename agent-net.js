@@ -145,9 +145,19 @@ function startHub({ selfName, peers, port, host = '0.0.0.0', onMessage, onPeerUp
     attachFraming(socket, (msg) => onMessage && onMessage(peerName, msg));
     socket.on('error', () => socket.destroy());
     socket.on('close', () => {
-      if (connected.get(peerName) === socket) connected.delete(peerName);
-      log(`[net] "${peerName}" disconnected`);
-      if (onPeerDown) onPeerDown(peerName);
+      // A socket that is no longer this peer's current one is a LEFTOVER: the peer already
+      // reconnected on a new socket, and said hello on it, before this one's close was noticed.
+      // That is the normal course when a connection dies without a FIN -- the dead socket only
+      // closes once keepalive gives up, long after the node's 3s retry has already succeeded.
+      // Reporting the peer as down then UNDOES the live connection's registration: the socket
+      // survives (the delete below is guarded), but onPeerDown drops the agent from the hub's
+      // roster, so it is connected and unroutable at the same time -- and it never notices,
+      // because its own link is fine. Found 2026-11-08, after Steve had been invisible to the
+      // hub for hours while his own log said he was connected.
+      const current = connected.get(peerName) === socket;
+      if (current) connected.delete(peerName);
+      log(`[net] "${peerName}" disconnected${current ? '' : ' (leftover connection -- already back on a new one)'}`);
+      if (current && onPeerDown) onPeerDown(peerName);
     });
   });
 

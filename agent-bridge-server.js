@@ -759,7 +759,8 @@ confirmer.ready.then(() => overlay.pushPage({ type: 'permissions', status: permi
 const updater = updaterLib.createUpdater({
   root: __dirname, agentName: AGENT.name, confirmer,
   isIdle: () => busyTargets.size === 0 && !currentPresentation && !currentClaudeChild,
-  onChange: (update) => overlay.pushPage({ type: 'update', update })
+  onChange: (update) => overlay.pushPage({ type: 'update', update }),
+  autoUpdate: config.autoUpdate === true
 });
 updater.start();
 
@@ -1368,12 +1369,12 @@ function askOscarDirectly(userText, myRequestId) {
   // line a long pasted text ended Nova's whole process, and a line break once truncated a message.
   const prompt = sessionId
     ? [userText, events].filter(Boolean).join('\n\n')
-    : [`You are ${AGENT.name}, the central coordinator of a network of AI assistant colleagues. ${AGENT.personality}`, events, `Message: ${userText}`].filter(Boolean).join('\n\n');
+    : [`You are ${AGENT.name}, the central coordinator of a network of AI assistant colleagues.`, events, `Message: ${userText}`].filter(Boolean).join('\n\n');
   const args = ['-p'];
   if (sessionId) args.push('--resume', sessionId);
   // Only a pointer to the skills, through --append-system-prompt rather than the message -- see
   // buildSystemPointer for why. Identical on every turn, so it no longer breaks the prompt cache.
-  args.push('--append-system-prompt', buildSystemPointer({ agentName: AGENT.name, canProvision: true }));
+  args.push('--append-system-prompt', buildSystemPointer({ agentName: AGENT.name, personality: AGENT.personality, canProvision: true }));
   args.push('--output-format', 'json');
   if (AGENT.effort) args.push('--effort', AGENT.effort);
   if (AGENT.model) args.push('--model', AGENT.model);

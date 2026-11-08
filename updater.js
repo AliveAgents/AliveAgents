@@ -29,6 +29,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { execFile } = require('child_process');
 
 const SOURCE = { owner: 'AliveAgents', repo: 'AliveAgents', branch: 'master' };
 const MANIFEST_FILE = 'release.json';
@@ -37,6 +38,7 @@ const RESTART_CODE = 75;
 const FIRST_CHECK_MS = 60 * 1000;
 const CHECK_EVERY_MS = 24 * 60 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 30 * 1000;
+const GIT_TIMEOUT_MS = 120 * 1000;
 const FILE_MAX_BYTES = 5 * 1024 * 1024;
 const VERSION_RE = /^\d{4}\.\d{2}\.\d{2}-\d{1,4}$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
@@ -115,7 +117,7 @@ function fileHash(file) {
 // root: the program folder. agentName: string or function. confirmer: device-confirm.js. isIdle(): true when
 // nothing is running that a restart would cut off. onChange(publicState): tell the face pages. onRestart():
 // end this process with RESTART_CODE (a parameter for the tests). env: for the tests.
-function createUpdater({ root, agentName, confirmer, isIdle = () => true, onChange = () => {}, onRestart, log = console.log, env = process.env }) {
+function createUpdater({ root, agentName, confirmer, isIdle = () => true, onChange = () => {}, onRestart, log = console.log, env = process.env, autoUpdate = false }) {
   const nameNow = () => (typeof agentName === 'function' ? agentName() : agentName);
   const testSource = env.ALIVEAGENTS_UPDATE_SOURCE || '';
   const apiBase = testSource ? `${testSource}/api` : 'https://api.github.com';
@@ -149,7 +151,8 @@ function createUpdater({ root, agentName, confirmer, isIdle = () => true, onChan
     return {
       status: state.status, problem: state.problem, agentName: nameNow(), installed: installedVersion(), root,
       latest: state.latest ? { version: state.latest.version, published: state.latest.published } : null,
-      changedCount: state.changed.length, manual: state.manual.slice(), restartable, checkedAt: state.checkedAt
+      changedCount: state.changed.length, manual: state.manual.slice(), restartable, checkedAt: state.checkedAt,
+      git: managedByGit, autoUpdate: managedByGit && autoUpdate
     };
   }
 
@@ -209,8 +212,17 @@ function createUpdater({ root, agentName, confirmer, isIdle = () => true, onChan
       // his face page said nothing at all. Checking is free and harmless; writing over a working copy
       // someone is editing is what the rule was there to prevent, and that part stays.
       if (managedByGit) {
-        set({ status: 'git-update', problem: 'This copy is managed with git, so it does not update itself.', latest: manifest, commit, changed, manual, checkedAt: now });
-        log(`[update] Version ${manifest.version} is out (${changed.length} files). This copy is managed with git: "git pull" in ${root}, then restart.`);
+        // A git copy is updated BY git: a fast-forward to the very commit whose release.json was just
+        // verified against this installation's public key. Pinning the merge to that commit instead of
+        // to whatever the branch happens to point at keeps the signature as the thing that authorises
+        // the new code. Only ever with a clean working copy and only as a fast-forward, so nothing
+        // local can be overwritten and no merge -- and therefore no conflict -- is possible. The rule
+        // this branch used to keep by doing nothing still holds: a copy somebody edits is reported,
+        // never written over. That is what the clean-copy check below decides, per machine.
+        const byItself = autoUpdate && !manual.length;
+        set({ status: 'git-update', problem: byItself ? null : 'This copy is managed with git, so it does not update itself.', latest: manifest, commit, changed, manual, checkedAt: now });
+        log(`[update] Version ${manifest.version} is out (${changed.length} files).${byItself ? ' Bringing this git copy forward.' : ` This copy is managed with git: press Install on ${nameNow()}'s page, or "git pull" in ${root} and restart.`}`);
+        if (byItself) whenIdle(() => { gitInstall(manifest).catch((e) => log(`[update] The git update failed: ${e.message}`)); });
         return publicState();
       }
       set({ status: manual.length ? 'manual' : 'available', problem: null, latest: manifest, commit, changed, manual, checkedAt: now });
@@ -233,14 +245,58 @@ function createUpdater({ root, agentName, confirmer, isIdle = () => true, onChan
   }
 
   // Resolves { ok } or { error } -- a sentence for the page.
+  // Runs git in this folder. Never throws: every caller wants a sentence for the page, not a stack.
+  function gitRun(args) {
+    return new Promise((resolve) => {
+      execFile('git', args, { cwd: root, timeout: GIT_TIMEOUT_MS, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+        const text = (s) => String(s || '').trim();
+        resolve({ ok: !err, out: text(stdout), err: text(stderr) || (err ? err.message : '') });
+      });
+    });
+  }
+
+  // The git half of installing. Every step is checked, and it stops at the first thing that is not
+  // plainly safe rather than trying to repair anything.
+  async function gitInstall(manifest) {
+    if (busy) return { error: 'An update is already being checked or installed.' };
+    busy = true;
+    set({ status: 'installing', problem: null });
+    const stop = (why) => {
+      busy = false;
+      log(`[update] Not updated: ${why}`);
+      set({ status: 'git-update', problem: `Not updated: ${why}` });
+      return { error: why };
+    };
+    if (state.manual.length) return stop(`this version also changes ${state.manual.join(', ')}, which is started by hand, so it is left alone.`);
+    if (!/^[0-9a-f]{40}$/.test(String(state.commit || ''))) return stop('the published release does not name a commit.');
+    if (!(await gitRun(['--version'])).ok) return stop('git is not available on this machine.');
+    const dirty = await gitRun(['status', '--porcelain']);
+    if (!dirty.ok) return stop(`git could not read this folder: ${dirty.err}`);
+    if (dirty.out) return stop(`this copy has ${dirty.out.split('\n').length} file(s) of its own changed, so nothing was touched. Commit or discard them first.`);
+    const fetched = await gitRun(['fetch', '--quiet', 'origin']);
+    if (!fetched.ok) return stop(`git could not fetch from the remote: ${fetched.err}`);
+    if (!(await gitRun(['cat-file', '-e', `${state.commit}^{commit}`])).ok) return stop('the published commit is not among what this folder fetched from its remote.');
+    if (!(await gitRun(['merge-base', '--is-ancestor', 'HEAD', state.commit])).ok) return stop('this copy is not simply behind the published commit, so a fast-forward is not possible.');
+    const merged = await gitRun(['merge', '--ff-only', state.commit]);
+    if (!merged.ok) return stop(`the fast-forward failed: ${merged.err}`);
+    busy = false;
+    log(`[update] Fast-forwarded to version ${manifest.version} (${state.commit.slice(0, 7)}).`);
+    set({ status: restartable ? 'restarting' : 'installed', problem: null, changed: [], manual: [] });
+    if (restartable) restartWhenIdle();
+    return { ok: true };
+  }
+
   async function install() {
-    if (state.status !== 'available' || !state.latest) return { error: state.status === 'manual' ? 'This version changes the start scripts or packages, so it has to be installed by hand.' : 'There is no update to install.' };
+    if (managedByGit) { if (state.status !== 'git-update' || !state.latest) return { error: 'There is no update to install.' }; }
+    else if (state.status !== 'available' || !state.latest) return { error: state.status === 'manual' ? 'This version changes the start scripts or packages, so it has to be installed by hand.' : 'There is no update to install.' };
     if (busy) return { error: 'An update is already being checked or installed.' };
     const manifest = state.latest;
     const { owner, repo } = SOURCE;
     const text = `AliveAgents: update ${nameNow()}'s program to version ${manifest.version}, published ${String(manifest.published || '').slice(0, 10)}. ${state.changed.length} files change.`;
     const answer = await confirmer.ask(text);
     if (!answer.ok) return { error: `${answer.reason} Nothing changed.` };
+    // A git copy is brought forward by git, with the same confirmation in front of it.
+    if (managedByGit) return gitInstall(manifest);
     busy = true;
     set({ status: 'installing', problem: null });
     const staging = path.join(root, '.update-staging');
@@ -290,20 +346,20 @@ function createUpdater({ root, agentName, confirmer, isIdle = () => true, onChan
 
   // Not on the spot: an idle agent would otherwise be gone before the page that pressed the button had its
   // answer (found by the live test).
-  function restartWhenIdle() {
+  function whenIdle(fn) {
     const tick = () => {
-      if (isIdle()) {
-        log('[update] Restarting to use the new version.');
-        restart();
-        return;
-      }
+      if (isIdle()) { fn(); return; }
       timers.push(setTimeout(tick, 2000));
     };
     timers.push(setTimeout(tick, 1500));
   }
 
+  function restartWhenIdle() {
+    whenIdle(() => { log('[update] Restarting to use the new version.'); restart(); });
+  }
+
   function start() {
-    if (managedByGit) log('[update] This copy is managed with git: new versions are reported, not installed.');
+    if (managedByGit) log(`[update] This copy is managed with git: new versions are ${autoUpdate ? 'brought in with a fast-forward once this folder is clean and idle' : 'reported, not installed'}.`);
     timers.push(setTimeout(() => { check(); }, FIRST_CHECK_MS));
     const daily = setInterval(() => { check(); }, CHECK_EVERY_MS);
     timers.push(daily);

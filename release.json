@@ -1,15 +1,15 @@
 {
   "format": 1,
   "name": "AliveAgents",
-  "version": "2026.11.08-3",
-  "published": "2026-11-08T19:35:15.082Z",
+  "version": "2026.11.09-1",
+  "published": "2026-11-09T19:26:32.680Z",
   "files": {
     ".gitignore": "78416c1dee4a6583da98872ab446f65001275ebe7c1aa52f3eb62c092a30e140",
     "CLAUDE.md": "546d6e0d7249ca7f0637dcb914e3fa597008e9d0ead10cacb5836bda4c6255cd",
     "LICENSE": "578f4b3fb5068f39cf6289a26851bc661b2f137d1fea30fa1d1f7d4aa8285e8c",
     "README.md": "b53198e9ca349c88a30d9e09dfc41e4ab01ae9a7fba4b0235627b93a985c6db0",
-    "agent-bridge-server.js": "7b74a81374eca1c4f61f7b0e90e65e5bf1aaa6bae6f10f7aa64a9fb62f7ff9a0",
-    "agent-face-overlay.user.js": "efadac45109fc57b4ceb80d5287020f3303572f30faa4ef71f876521aaf0aa9d",
+    "agent-bridge-server.js": "287e3ca79885c32f2115a4bd017fc040063925f16d0a9d2d6025a09f874d4b68",
+    "agent-face-overlay.user.js": "12383167c8b9a58dca6b83943288c675078e6e07ad6232df988b05f43d23eb21",
     "agent-home.js": "e5557cae209a24dbee895d43bf213d466667682772d70fa937602287a9f47cbe",
     "agent-net.js": "c97bb5a9c9b0814c3b7a13171faa2859f14d36137b7451ca5923fab242871600",
     "agent-registry.js": "f241eac5af3a3548d2e43cc06eb792cb007545c334d3d5c2c8858d3cf25689ea",
@@ -62,5 +62,5 @@
     "start.ps1": "b0345c6b216743a3cc53fc0a5d01d0d0372eeefd841056221d1119e223036517",
     "updater.js": "906d13ceaa72c72e251fbd63c254ed6f11442eb7a3ee05f636c4d0af201082db"
   },
-  "signature": "d3oZceQDtWQzbr6ACZ+wIVw4fvoTZEsC+UUfTOiTGsuB0Pd2Yszqq9vRkP+3n8r3D55xOQneM/m/ZwO9eUN1Bg=="
+  "signature": "8woG+jG26UPck1TeurIrEguKsOJzZhZl3C17pZe0SBjIjbRNWBBJUO/tpHWDdzUp4R59tBPHjtekKY5s5daYDw=="
 }

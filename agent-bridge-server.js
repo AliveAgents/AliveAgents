@@ -276,8 +276,13 @@ const presentationRelays = new Map();
 function clearDisplay() {
   currentPresentation = null;
   presentationOwnerRequestId = null;
-  if (mainDisplayTarget && mainDisplayTarget.nodeName !== null && hub && hub.isUp(mainDisplayTarget.nodeName)) {
-    try { hub.send(mainDisplayTarget.nodeName, { type: 'clear-presentation' }); } catch (e) {}
+  // EVERY node, not just the main display. Without a main display assigned ("/maindisplay off")
+  // each agent presents on its own screen, and this used to send to nobody at all -- so a phone
+  // kept showing a finished presentation until it was restarted (found on Steve, 2026-11-09).
+  // Safe to broadcast: this runs exactly once per genuinely new user input, which is precisely
+  // the moment nothing old should still be on any screen anywhere.
+  if (hub) {
+    try { hub.broadcast({ type: 'clear-presentation' }); } catch (e) {}
   }
   drainDisplayQueue();
 }

@@ -267,6 +267,11 @@
       #agent-face-overlay .agent-header{ font-size:13px; letter-spacing:.12em; text-transform:uppercase; }
       #agent-face-overlay .agent-dot{ width:8px; height:8px; border-radius:50%; background:currentColor; }
       #agent-face-overlay .agent-status{ opacity:.7; }
+      /* Not in the layout while hidden: this is a centred flex column, and a bubble that keeps
+         its text (opacity:0 alone) keeps its height and its gap, which shifts the face up by half
+         of the last reply's height and never gives it back. Reported 2026-11-09: "the face keeps
+         sliding further up over time" -- it was tracking how long the answers had become. */
+      #agent-face-overlay .agent-bubble:not(.show){ display:none; }
       #agent-face-overlay .agent-bubble{
         font-size:15px; padding:10px 16px; border-radius:8px;
         background:rgba(10,10,14,.6); color:#eee; opacity:0; transform:translateY(6px);

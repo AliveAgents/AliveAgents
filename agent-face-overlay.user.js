@@ -177,6 +177,14 @@
       animation:pixel-bob var(--dur-speak,.25s) ease-in-out infinite;
       animation-delay:var(--delay-random,0s);
     }
+    /* Out of the layout while hidden, for EVERY face -- which is why this sits here and not in a face's
+       own stylesheet: those are replaced wholesale on every face change, and each brings its own
+       .agent-bubble rule. The bubble shares the centred column with the face, and one that keeps its
+       text keeps its height and its gap, pushing the face up by half the last reply's height for good.
+       The first fix (2026-11-09) went into the built-in face's stylesheet -- a face none of the agents
+       wears (Oscar is kai, the phones wear generated faces), so it changed nothing. Measured on Oscar's
+       page afterwards: face top 61px with no text, -107px with a long one, and still -107px after it. */
+    #agent-face-overlay .agent-bubble:not(.show){ display:none; }
     #agent-face-overlay .agent-bubble.show{ opacity:1; transform:translateY(0); }
     /* Fixed color value, deliberately NOT currentColor/inherit: micBtn sits (because of the
        containing-block trap for .presenting, see above) as a SIBLING of #agent-face-overlay, not
@@ -267,11 +275,6 @@
       #agent-face-overlay .agent-header{ font-size:13px; letter-spacing:.12em; text-transform:uppercase; }
       #agent-face-overlay .agent-dot{ width:8px; height:8px; border-radius:50%; background:currentColor; }
       #agent-face-overlay .agent-status{ opacity:.7; }
-      /* Not in the layout while hidden: this is a centred flex column, and a bubble that keeps
-         its text (opacity:0 alone) keeps its height and its gap, which shifts the face up by half
-         of the last reply's height and never gives it back. Reported 2026-11-09: "the face keeps
-         sliding further up over time" -- it was tracking how long the answers had become. */
-      #agent-face-overlay .agent-bubble:not(.show){ display:none; }
       #agent-face-overlay .agent-bubble{
         font-size:15px; padding:10px 16px; border-radius:8px;
         background:rgba(10,10,14,.6); color:#eee; opacity:0; transform:translateY(6px);

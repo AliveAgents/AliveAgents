@@ -168,11 +168,15 @@ function isOwnPage(req, port) {
   return origin === undefined || [`http://localhost:${port}`, `http://127.0.0.1:${port}`, `http://[::1]:${port}`].includes(origin);
 }
 
-// onUserInput(text) is optional, and inputEnabled() says whether it is open right now. The hub passes
-// the browser's microphone through to task dispatch at all times. A node passes it too, but opens it
-// only while its hub is out of reach (user's wish, 2026-09-22: take the phone along, leave the rest at
-// home) -- while the hub is there, it stays the one microphone of the network. inputEnabled is checked
-// here, on every message, not only by the page that hides the button.
+// onUserInput(text) is optional, and inputEnabled(source) says whether it is open right now, for 'voice'
+// or 'typed'. The hub takes both at all times. A node takes TYPED text at any time (user's wish,
+// 2026-11-11, "Text überall": typing on a phone is only possible at that phone, and what an agent may
+// do is decided on its own device whichever way a sentence arrives), but opens its MICROPHONE only while
+// its hub is out of reach (2026-09-22: take the phone along, leave the rest at home). Several listening
+// microphones in one room hear each other's loudspeakers -- one agent reading out a mail could address
+// another by name -- so while the hub is there, it stays the one microphone of the network.
+// inputEnabled is checked here, on every message, not only by the page that hides the button.
+// selfChat (a node) makes the page offer a chat box for this device's own agent.
 // getAgents/onFileUpload are likewise hub-only: the file drop UI lists the whole network and
 // routes uploads, which only the hub knows how to do. A node passes neither and the routes stay off.
 // The class of a screen, as the face page reports it (screenClass in agent-face-overlay.user.js): the
@@ -288,7 +292,7 @@ function presentationLabel(marker) {
 // confirmations -- see permissions.js); reply(obj) answers exactly the page that asked.
 // faceRecipe: this agent's own face as data (face-design.js). With one, the page may ask for /faces/own.js
 // and gets a face nobody else has; without one it keeps asking for the hand-written faces in faces/.
-function startOverlayServer({ port, onUserInput, inputEnabled = () => true, getAgents, onFileUpload, onScreenChange, getDecisions, onDecision, onPageMessage, faceRecipe = null, log = console.log }) {
+function startOverlayServer({ port, onUserInput, inputEnabled = () => true, selfChat = false, getAgents, onFileUpload, onScreenChange, getDecisions, onDecision, onPageMessage, faceRecipe = null, log = console.log }) {
   const ownRecipe = faceRecipe ? faceDesign.cleanRecipe(faceRecipe, String(port)) : null;
   // Generated faces of other agents, kept only as long as they are needed: a handful of the last
   // speakers, dropped oldest first. Nothing here survives a restart -- the recipe comes with the
@@ -347,7 +351,10 @@ function startOverlayServer({ port, onUserInput, inputEnabled = () => true, getA
   // Mixed into every broadcast instead of maintaining its own state property: the overlay hides
   // the mic button when this value is false (a node while its hub is reachable -- see above).
   function withMicFlag(s) {
-    return Object.assign({}, s, { micEnabled: !!onUserInput && !!inputEnabled() });
+    return Object.assign({}, s, {
+      micEnabled: !!onUserInput && !!inputEnabled('voice'),
+      chatHere: !!selfChat && !!onUserInput && !!inputEnabled('typed')
+    });
   }
 
   function broadcast() {
@@ -450,11 +457,11 @@ function startOverlayServer({ port, onUserInput, inputEnabled = () => true, getA
           chatClients.add(ws);
           if (getDecisions) ws.send(JSON.stringify({ type: 'decisions', list: getDecisions() }));
         }
-        if (msg.type === 'user-input' && onUserInput && inputEnabled() && typeof msg.text === 'string' && msg.text.trim()) {
-          // The optional agent name comes from the stage page's per-agent chat box; the microphone
-          // never sets it, so spoken input keeps going through normal routing untouched -- and that
-          // same difference tells the hub whether the text was typed or spoken.
-          const typed = typeof msg.agent === 'string';
+        // The optional agent name comes from the stage page's chat box; the microphone never sets it, so
+        // spoken input keeps going through normal routing untouched -- and that same difference tells the
+        // hub, and a node, whether the text was typed or spoken. The two are opened separately.
+        const typed = typeof msg.agent === 'string';
+        if (msg.type === 'user-input' && onUserInput && inputEnabled(typed ? 'typed' : 'voice') && typeof msg.text === 'string' && msg.text.trim()) {
           onUserInput(msg.text.trim(), typed ? msg.agent : null, typed ? 'typed' : 'voice');
         }
         // Answers exactly the page that asked, when it gave a reqId to match the answer with.

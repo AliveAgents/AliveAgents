@@ -121,8 +121,8 @@ let offlineTimer = null;
 const TASK_TIMEOUT_MINUTES = Number.isFinite(Number(config.taskTimeoutMinutes)) ? Math.max(0, Number(config.taskTimeoutMinutes)) : 15;
 const TASK_TIMEOUT_MS = TASK_TIMEOUT_MINUTES * 60000;
 
-// Own overlay (face) on this machine. Its microphone and typed input reach handleLocalInput only while
-// localInput is on -- overlay-server.js checks inputEnabled on every message, not just the button.
+// Own overlay (face) on this machine. Typed input reaches handleLocalInput at any time, its microphone only
+// while localInput is on -- overlay-server.js checks inputEnabled on every message, not just the button.
 const OVERLAY_PORT = config.overlayPort || 8787;
 // The class of the screen this agent's face page is shown on, or null (see normalizeScreen in
 // overlay-server.js). It changes when a browser on this machine opens or closes the page -- not when
@@ -131,7 +131,8 @@ let myScreen = null;
 const overlay = startOverlayServer({
   port: OVERLAY_PORT,
   onUserInput: (text, agent, source) => handleLocalInput(text, source),
-  inputEnabled: () => localInput,
+  inputEnabled: (source) => source === 'typed' || localInput,
+  selfChat: true,
   // This agent's own face, drawn from the recipe it was given when it was set up (face-design.js).
   faceRecipe: config.faceRecipe || null,
   // This device's own permissions page. permissionStore is created further down; nothing can ask
@@ -524,6 +525,7 @@ function playAndReport(segments, text, myRequestId, hubRequestId, suggestedNext 
 }
 
 function say(text, myRequestId, hubRequestId, suggestedNext = [], isMainDisplay = false) {
+  noteChatReply(myRequestId, text);
   speaker.synthesizeSpeech(text, (filePath) => {
     if (myRequestId !== requestId) { if (filePath) fs.unlink(filePath, () => {}); return; }
     playAndReport(filePath ? [{ filePath, text }] : null, text, myRequestId, hubRequestId, suggestedNext, isMainDisplay);
@@ -545,6 +547,7 @@ function say(text, myRequestId, hubRequestId, suggestedNext = [], isMainDisplay 
 // guards it the same way it guards an incoming presentation: whatever starts later wins the screen.
 function presentOnOwnScreen(slideTexts, myRequestId, hubRequestId, url, suggestedNext) {
   const text = slideTexts.join(' ');
+  noteChatReply(myRequestId, text);
   // This agent's own page is shown from memory under a fresh local link (see showPage in
   // overlay-server.js), exactly like a page that arrived from someone else.
   const page = readOwnContent(url);
@@ -668,6 +671,7 @@ function runTask(userText, myRequestId, hubRequestId, isMainDisplay = false, opt
     return;
   }
   interruptCurrent();
+  turnFromHub = hubRequestId !== undefined;
   setOverlayState({ status: 'thinking', text: '', agent: AGENT.name });
 
   refreshSkillData();
@@ -685,9 +689,13 @@ function runTask(userText, myRequestId, hubRequestId, isMainDisplay = false, opt
   const inboxEvent = inboxLib.buildInboxEvent(inboxLib.listInbox(__dirname), newInboxFiles);
   newInboxFiles.clear();
   // Without it the agent would promise to pass things on to agents it cannot reach.
+  // Typed on this device while the hub is there: the answer stays here, so a FORWARD marker would reach
+  // nobody -- the agent is told, rather than promising to pass something on that silently goes nowhere.
   const directEvent = options.direct
     ? 'The hub is out of reach right now, so the user is talking to you directly on this device. No other agent can be reached: answer yourself, and do not offer to pass anything on.'
-    : '';
+    : options.typedHere
+      ? 'The owner typed this on your own face page, directly to you and not through Oscar. Your answer is shown and spoken here, on this device only, and nothing of it goes back to Oscar -- so no other agent can be involved from this message. If someone else should do something, say so: the owner can write to them on their own page.'
+      : '';
   const events = `${identityEvent} ${identityNotice} ${rosterEvent} ${inboxEvent} ${directEvent}`.trim();
   identityNotice = '';
 
@@ -851,7 +859,9 @@ function runTask(userText, myRequestId, hubRequestId, isMainDisplay = false, opt
     if (presentationUrl && !turnPermissions.presentations) console.log(`[${AGENT.name}] Not presenting ${presentationLabel(presentationUrl)} -- switched off in this agent's permissions.`);
     const presenting = presentationUrl && turnPermissions.presentations;
     // A main display is only reachable through the hub; without it, the agent's own screen.
-    if (presenting && knownMainDisplay && hubUp) {
+    // Typed here, shown here: the owner is at this device, and a deck sent through the hub on behalf of a
+    // turn the hub never asked for would have no request to belong to.
+    if (presenting && knownMainDisplay && hubUp && !options.typedHere) {
       sayWithPresentation(slideSegments, myRequestId, hubRequestId, presentationUrl, suggested, isMainDisplay);
       return;
     }
@@ -937,22 +947,48 @@ function setLocalInput(on) {
   }
   console.log(on
     ? `[${AGENT.name}] The hub is out of reach -- this device's own microphone is on (face page).`
-    : `[${AGENT.name}] The hub is reachable again -- input goes through it, this device's microphone is off.`);
+    : `[${AGENT.name}] The hub is reachable again -- speech goes through it and this device's microphone is off; typing on the face page still works.`);
   // Re-sent unchanged, so the face page learns about the microphone at once (micEnabled, overlay-server.js).
   const prev = overlay.getState();
   setOverlayState({ status: prev.status, text: prev.text, agent: prev.agent || AGENT.name });
 }
 
-// Speech from this device's own face page -- only ever while the hub is out of reach (overlay-server.js
-// asks inputEnabled first, and this checks again). From here on it is a task like one from the hub, minus
-// the hub: nothing is reported, nothing handed on, and the agent is told so (runTask, options.direct).
+// Input from this device's own face page. Typed text comes at any time, speech only while the hub is out
+// of reach (overlay-server.js asks inputEnabled first, and this checks again). From here on it is a task
+// like one from the hub, minus the hub: nothing is reported, nothing handed on, and the agent is told so
+// (runTask, options.direct / options.typedHere). An answer to typed text also goes into the chat box.
 function handleLocalInput(text, source) {
-  if (!localInput) return;
+  const typed = source === 'typed';
+  if (!typed && !localInput) return;
+  if (typed) overlay.pushChat({ agent: AGENT.name, from: 'you', text });
+  // The newest input stops the running one, everywhere in this program -- but not a task from the hub.
+  // The hub waits for that answer and keeps this agent reserved until it comes (up to its route watchdog,
+  // twenty minutes), so cutting it off would leave the whole network waiting for nothing.
+  if (typed && hubTaskRunning()) {
+    console.log(`[${AGENT.name}] Typed on this device while busy with a task from the hub -- not started: ${text}`);
+    overlay.pushChat({ agent: AGENT.name, from: 'system', text: `${AGENT.name} is in the middle of something Oscar handed over. Send it again when that is done.` });
+    return;
+  }
   const myRequestId = ++requestId;
-  console.log(`[${AGENT.name}] Heard directly on this device (${source}): ${text}`);
+  console.log(`[${AGENT.name}] ${typed ? 'Typed' : 'Heard'} directly on this device: ${text}`);
   // A new request takes the previous deck off the screen, as a new input at the hub does.
   currentPresentation = null;
-  runTask(text, myRequestId, undefined, false, { direct: true });
+  if (typed) chatTurns.add(myRequestId);
+  runTask(text, myRequestId, undefined, false, localInput ? { direct: true } : { typedHere: true });
+}
+
+// Turns typed into the chat box whose answer still has to appear there (noteChatReply, from say and
+// presentOnOwnScreen -- the two places every answer of a local turn goes through).
+const chatTurns = new Set();
+function noteChatReply(myRequestId, text) {
+  if (!chatTurns.delete(myRequestId)) return;
+  overlay.pushChat({ agent: AGENT.name, from: 'agent', text });
+}
+
+// Whether the turn in progress came from the hub and is not over yet: thinking, speaking, or presenting.
+let turnFromHub = false;
+function hubTaskRunning() {
+  return turnFromHub && (!!currentClaudeChild || !!currentPresentation || overlay.getState().status !== 'idle');
 }
 
 // Counting starts now: a device that never finds its hub -- a phone taken along -- offers its own
@@ -977,6 +1013,12 @@ const link = connectToHub({
   onClose: () => hubReachable(false),
   onMessage: (msg) => {
     if (msg.type === 'task' && typeof msg.text === 'string') {
+      // The newest input stops the running one. If that was a message typed on this device, its chat box
+      // says so instead of the message vanishing without a word.
+      if (chatTurns.size) {
+        chatTurns.clear();
+        overlay.pushChat({ agent: AGENT.name, from: 'system', text: `Oscar handed ${AGENT.name} something else, so your message was stopped. Send it again in a moment.` });
+      }
       const myRequestId = ++requestId; // own, local counter -- independent of the hub
       console.log(`[${AGENT.name}] Task: ${msg.text}`);
       runTask(msg.text, myRequestId, msg.requestId, !!msg.isMainDisplay);

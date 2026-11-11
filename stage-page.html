@@ -70,6 +70,9 @@
   }
   .chat-btn:hover { border-color: #7fd1e8; color: #e9ebf0; }
   .agent.off .chat-btn { opacity: .5; cursor: not-allowed; }
+  /* A node's face page has no agent list (that is the hub's), so its one chat box -- for the agent of
+     this device -- opens from here. Same corner as the hub's list, which a node never shows. */
+  #self-chat-btn { position: fixed; left: 18px; bottom: 18px; z-index: 1000; font-size: .85rem; padding: .35rem .8rem; }
 
   #chat {
     position: fixed; left: 18px; bottom: 18px; z-index: 1001;
@@ -318,6 +321,7 @@
 <script src="/agent-face-overlay.user.js"></script>
 
 <div id="drop-rail" class="hidden"><div class="rail-title">Agents</div></div>
+<button id="self-chat-btn" class="chat-btn" type="button" hidden>write…</button>
 
 <div id="decisions" aria-live="polite"></div>
 
@@ -497,6 +501,8 @@
       if (m && m.type === 'join' && m.join) { showJoin(m.join); return; }
       if (m && m.type === 'login' && m.login) { showLogin(m.login); return; }
       if (m && m.type === 'decisions' && Array.isArray(m.list)) { renderDecisions(m.list); return; }
+      // A state broadcast carries no type. On a node it says whether this device's own agent takes typed text.
+      if (m && m.type === undefined && typeof m.status === 'string') { syncSelfChat(m); return; }
       if (!m || m.type !== 'chat' || !m.agent) return;
       // "you" entries are echoed back by the server, but the panel already showed them optimistically.
       if (m.from === 'you') { markSent(m.agent, m.text); return; }
@@ -551,11 +557,21 @@
 
   function closeChat() { panel.classList.remove('open'); openAgent = null; }
 
+  // The one chat box a node offers: for the agent of this device (chatHere, overlay-server.js).
+  const selfBtn = document.getElementById('self-chat-btn');
+  let selfAgent = null;
+  function syncSelfChat(s) {
+    selfAgent = s.chatHere === true && typeof s.agent === 'string' && s.agent ? s.agent : null;
+    selfBtn.hidden = !selfAgent;
+    if (selfAgent) selfBtn.textContent = `write to ${selfAgent}…`;
+  }
+  selfBtn.addEventListener('click', () => { if (selfAgent) openChat(selfAgent); });
+
   function send() {
     const text = textEl.value.trim();
     if (!text || !openAgent) return;
     if (!socket || socket.readyState !== WebSocket.OPEN) {
-      add(openAgent, 'system', 'Not connected to the hub right now.');
+      add(openAgent, 'system', 'Not connected right now -- the page reconnects by itself.');
       return;
     }
     const thread = history.get(openAgent) || [];

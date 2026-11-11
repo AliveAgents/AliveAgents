@@ -1,8 +1,8 @@
 {
   "format": 1,
   "name": "AliveAgents",
-  "version": "2026.11.11-1",
-  "published": "2026-11-11T17:18:39.015Z",
+  "version": "2026.11.11-2",
+  "published": "2026-11-11T17:57:28.907Z",
   "files": {
     ".gitignore": "78416c1dee4a6583da98872ab446f65001275ebe7c1aa52f3eb62c092a30e140",
     "CLAUDE.md": "546d6e0d7249ca7f0637dcb914e3fa597008e9d0ead10cacb5836bda4c6255cd",
@@ -44,8 +44,8 @@
     "login.bat": "cf55f548a358619870ac8c4c59d2f8e41e662497a4db34a04b00024a0a296295",
     "make-certs.sh": "fd5b76e6c9403669c6bd10017f2e961a40681178d28163a9c1aee38cc1e589d7",
     "net-config.example.json": "5e6acce1aea00ec66a38ad82d18429b174c82531e64b4a1e9ce2e3f9662b44f4",
-    "node-agent.js": "e7bc6903018260a51ab850faa5fa146aa6df72b8c771983ced8fd789d971f809",
-    "overlay-server.js": "1e48e26f69419b261d073fbc69b4ae25648ef78a6226e9ac15dba787658edc90",
+    "node-agent.js": "3f03966207f692935bd7f0a905e1d5c8da5a4063c5e508ac6fe362564aad45c9",
+    "overlay-server.js": "b72170820f3824ee7f3950f275e1f28a12d2b203f16d40e1ecbe05f2f3eb3ce4",
     "package-lock.json": "53409f7da0ae76f2b7fd5ac68f85d83f93b463e5a84aacb7b27e75652ee5fc99",
     "package.json": "b97716189029e1b4dfc14f0294b5c8e0b6524a0daab114a8cb74da61e2f4548a",
     "permissions.js": "051af177d813a2cdbd3e5ca27f7e10b83feeb025cbffe5036994bb914d3b999d",
@@ -55,12 +55,12 @@
     "restart-node-foreground.ps1": "411b5fe91f0a747820adf48b30b5ba39f260aee9392beda108e56e2f40d9a34b",
     "setup-termux.sh": "76fe45e063e9a5be9053152a4bd61ae51aa780707598795df74dbbaf75c0023f",
     "speech.js": "0403af2c55f9814876fc1fff876c8f498cd035c47e019688adf916cbd04d0d92",
-    "stage-page.html": "e32f669962f4dfdddaa154b02e7673b39627848504f18f83e4d3524366769d9e",
+    "stage-page.html": "53298cfac479502c1da46630bad05af2b210780e871765c7f0b56f2fbf30b34a",
     "start-node.bat": "0612c961996391edcc55302f1171e8a3f6ad32d3a1089906228401b87ce17258",
     "start-node.sh": "09ab21094d9c50cade6956a797c5c8221015aa16eefa65cf3cd240a3296bab96",
     "start.bat": "08fd98a9f4a6cf50d061fabba37133e8a3f0d4090278c17b2b22b8f34f635112",
     "start.ps1": "b0345c6b216743a3cc53fc0a5d01d0d0372eeefd841056221d1119e223036517",
     "updater.js": "906d13ceaa72c72e251fbd63c254ed6f11442eb7a3ee05f636c4d0af201082db"
   },
-  "signature": "BHDQ4BH4RKTGWjGHu0rLUpb1fXjIVgbQNGOest3q7F4bFj1hEiFeOewT20u0Vn99osIQAJ0SO47j1EW0RVDVDw=="
+  "signature": "jzcJ4V5oikDt0vqKm3k6JbmZncnfOOhcB+p+elLN5Jt+kHWeuJz6rHXXjh+Kp3oUuVRlbF19FxjIaEvsSwMWCA=="
 }

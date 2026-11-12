@@ -72,10 +72,12 @@
   .agent.off .chat-btn { opacity: .5; cursor: not-allowed; }
   /* A node's face page has no agent list (that is the hub's), so its one chat box -- for the agent of
      this device -- opens from here. Same corner as the hub's list, which a node never shows. */
-  #self-chat-btn { position: fixed; left: 18px; bottom: 18px; z-index: 1000; font-size: .85rem; padding: .35rem .8rem; }
+  /* Topmost layer, like the fullscreen button: it has to stay usable while something is presented -- the
+     moment the owner most wants to say something. See keepAboveOverlay. */
+  #self-chat-btn { position: fixed; left: 18px; bottom: 18px; z-index: 2147483647; font-size: .85rem; padding: .35rem .8rem; font-family: "Segoe UI", -apple-system, Helvetica, Arial, sans-serif; }
 
   #chat {
-    position: fixed; left: 18px; bottom: 18px; z-index: 1001;
+    position: fixed; left: 18px; bottom: 18px; z-index: 2147483647;
     width: 380px; max-width: calc(100vw - 36px); height: min(460px, calc(100vh - 36px));
     background: #12151b; border: 1px solid #2b2e38; border-radius: 11px;
     display: none; flex-direction: column; overflow: hidden;
@@ -550,6 +552,7 @@
   function openChat(agent) {
     openAgent = agent;
     nameEl.textContent = agent;
+    keepAboveOverlay(panel); // before the focus below -- moving a focused element would drop it
     panel.classList.add('open');
     render();
     textEl.focus();
@@ -557,12 +560,26 @@
 
   function closeChat() { panel.classList.remove('open'); openAgent = null; }
 
+  // The face overlay hangs its elements off <html> itself, after <body> -- its presentation frame among
+  // them, which covers the whole page while something is shown. At the same (topmost) z-index, document
+  // order decides, so whatever must stay usable during a presentation has to come after the overlay.
+  // Moved only when part of the overlay is behind it: moving the chat box while someone types in it would
+  // take the focus out of the text field. Found 2026-11-12: the chat button vanished under Steve's
+  // presentation, exactly when the owner wanted to write to him.
+  function keepAboveOverlay(el) {
+    const kids = Array.from(document.documentElement.children);
+    const at = kids.indexOf(el);
+    const overlayAfter = kids.slice(at + 1).some((k) => k.id === 'agent-presentation-frame' || k.id === 'agent-face-overlay');
+    if (at === -1 || overlayAfter) document.documentElement.appendChild(el);
+  }
+
   // The one chat box a node offers: for the agent of this device (chatHere, overlay-server.js).
   const selfBtn = document.getElementById('self-chat-btn');
   let selfAgent = null;
   function syncSelfChat(s) {
     selfAgent = s.chatHere === true && typeof s.agent === 'string' && s.agent ? s.agent : null;
     selfBtn.hidden = !selfAgent;
+    if (selfAgent) keepAboveOverlay(selfBtn);
     if (selfAgent) selfBtn.textContent = `write to ${selfAgent}…`;
   }
   selfBtn.addEventListener('click', () => { if (selfAgent) openChat(selfAgent); });

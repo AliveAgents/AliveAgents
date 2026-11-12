@@ -1,8 +1,8 @@
 {
   "format": 1,
   "name": "AliveAgents",
-  "version": "2026.11.11-2",
-  "published": "2026-11-11T17:57:28.907Z",
+  "version": "2026.11.12-1",
+  "published": "2026-11-12T07:04:28.400Z",
   "files": {
     ".gitignore": "78416c1dee4a6583da98872ab446f65001275ebe7c1aa52f3eb62c092a30e140",
     "CLAUDE.md": "546d6e0d7249ca7f0637dcb914e3fa597008e9d0ead10cacb5836bda4c6255cd",
@@ -55,12 +55,12 @@
     "restart-node-foreground.ps1": "411b5fe91f0a747820adf48b30b5ba39f260aee9392beda108e56e2f40d9a34b",
     "setup-termux.sh": "76fe45e063e9a5be9053152a4bd61ae51aa780707598795df74dbbaf75c0023f",
     "speech.js": "0403af2c55f9814876fc1fff876c8f498cd035c47e019688adf916cbd04d0d92",
-    "stage-page.html": "53298cfac479502c1da46630bad05af2b210780e871765c7f0b56f2fbf30b34a",
+    "stage-page.html": "218998a823e6266dc93386dd2c7f43c3901e22afa5ad42dcfe8daa43f6f76c19",
     "start-node.bat": "0612c961996391edcc55302f1171e8a3f6ad32d3a1089906228401b87ce17258",
     "start-node.sh": "09ab21094d9c50cade6956a797c5c8221015aa16eefa65cf3cd240a3296bab96",
     "start.bat": "08fd98a9f4a6cf50d061fabba37133e8a3f0d4090278c17b2b22b8f34f635112",
     "start.ps1": "b0345c6b216743a3cc53fc0a5d01d0d0372eeefd841056221d1119e223036517",
     "updater.js": "906d13ceaa72c72e251fbd63c254ed6f11442eb7a3ee05f636c4d0af201082db"
   },
-  "signature": "jzcJ4V5oikDt0vqKm3k6JbmZncnfOOhcB+p+elLN5Jt+kHWeuJz6rHXXjh+Kp3oUuVRlbF19FxjIaEvsSwMWCA=="
+  "signature": "8aAKt77MGsKh3ayIni9dYHGCy+YeYb26hygqhY2GpHQrdIBXjOdkTFvPZHgcTuuo9+ic6UrmNm1Dsg5bfTBqDw=="
 }
